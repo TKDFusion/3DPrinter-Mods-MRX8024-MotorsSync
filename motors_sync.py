@@ -270,6 +270,139 @@ class EncoderHelper:
         self.axis.new_magnitude = self.axis.magnitude
 
 
+class FanController:
+    def __init__(self, fan, printer):
+        self.fan = fan
+        self.printer = printer
+        self.is_hold = False
+
+    def _hold(self):
+        self.printer.invoke_shutdown("Exception in motors_sync")
+
+    def _resume(self):
+        self.printer.invoke_shutdown("Exception in motors_sync")
+
+    def set_state(self, state):
+        if not state:
+            if self.is_hold:
+                return
+            self.is_hold = True
+            self._hold()
+        else:
+            if not self.is_hold:
+                return
+            self.is_hold = False
+            self._resume()
+
+    def _set_fan_speed(self, value):
+        now = self.printer.get_reactor().monotonic()
+        print_time = self.fan.fan.get_mcu().estimated_print_time(now)
+        self.fan.fan.set_speed(value=value,
+            print_time=print_time + PIN_MIN_TIME)
+
+
+class HeaterFanController(FanController):
+    def __init__(self, fan, printer):
+        super().__init__(fan, printer)
+        self.fan_speed = fan.fan_speed
+
+    def _hold(self):
+        self.fan.fan_speed = self.fan.last_speed = 0.0
+        self._set_fan_speed(0.0)
+
+    def _resume(self):
+        self.fan.fan_speed = self.fan.last_speed = self.fan_speed
+        self._set_fan_speed(self.fan_speed)
+
+
+class TemperatureFanController(FanController):
+    def __init__(self, fan, printer):
+        super().__init__(fan, printer)
+        self.target_temp = None
+        self.min_speed = None
+        self.max_speed = None
+
+    def _hold(self):
+        _, self.target_temp = self.fan.get_temp(0)
+        self.min_speed = self.fan.get_min_speed()
+        self.max_speed = self.fan.get_max_speed()
+        self.fan.set_temp(0)
+        self.fan.set_min_speed(0)
+        self.fan.set_max_speed(0)
+        self._set_fan_speed(0)
+
+    def _resume(self):
+        self.fan.set_temp(self.target_temp)
+        self.fan.set_min_speed(self.min_speed)
+        self.fan.set_max_speed(self.max_speed)
+        self.target_temp = None
+        self.min_speed = None
+        self.max_speed = None
+
+
+class FanProxy:
+    def __init__(self, manager, axis_name, fan_names):
+        self._manager = manager
+        self._axis_name = axis_name
+        self._fan_names = fan_names
+
+    def toggle(self, state):
+        for name in self._fan_names:
+            self._manager._request_toggle(name, self._axis_name, state)
+
+
+class FanManager:
+    from . import heater_fan, temperature_fan
+    FAN_METHODS = {
+        heater_fan.PrinterHeaterFan: HeaterFanController,
+        temperature_fan.TemperatureFan: TemperatureFanController,
+    }
+    del heater_fan, temperature_fan
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self._fans = {}
+        self._fan_off_requests = {}
+
+    def register_fans(self, axis_name, fan_names):
+        for name in fan_names:
+            if name in self._fans:
+                continue
+            self._register_fan(name)
+        return FanProxy(self, axis_name, fan_names)
+
+    def _register_fan(self, fan_name):
+        try:
+            fan_obj = self.printer.lookup_object(fan_name)
+        except:
+            if len(fan_name.split()) != 1:
+                raise self.printer.config_error(
+                    f"motors_sync: Unknown fan '{fan_name}'")
+            raise self.printer.config_error(
+                f"motors_sync: Provide full fan '{fan_name}' name "
+                f"in 'head_fan' option, e.g. 'heater_fan {fan_name}'")
+        controller_cls = None
+        for fan_type, ctrl_type in self.FAN_METHODS.items():
+            if isinstance(fan_obj, fan_type):
+                controller_cls = ctrl_type
+                break
+        if not controller_cls:
+            raise self.printer.config_error(
+                f"motors_sync: Unknown fan type '{fan_name}' "
+                f"--> '{type(fan_obj).__name__}' object")
+        self._fans[fan_name] = controller_cls(fan_obj, self.printer)
+        self._fan_off_requests[fan_name] = set()
+
+    def _request_toggle(self, fan_name, axis_id, state):
+        off_set = self._fan_off_requests[fan_name]
+        if state:
+            off_set.discard(axis_id)
+        else:
+            off_set.add(axis_id)
+        controller = self._fans[fan_name]
+        should_be_on = len(off_set) == 0
+        controller.set_state(should_be_on)
+
+
 class MotionAxis:
     VALID_MSTEPS = [256, 128, 64, 32, 16, 8, 0]
     def __init__(self, sync, name, jx, ph_off):
@@ -311,10 +444,10 @@ class MotionAxis:
         sync.add_connect_task(self._init_steppers)
         sync.add_connect_task(self._init_tmc_drivers)
         self._init_chip_helper()
-        sync.add_connect_task(self._init_fan)
-        self.conf_fan = self.config.get(f'head_fan_{name}', '')
-        if not self.conf_fan:
-            self.conf_fan = self.config.get('head_fan', None)
+        conf_fan = self.config.get(f'head_fan_{name}', '')
+        if not conf_fan:
+            conf_fan = self.config.get('head_fan', None)
+        sync.add_connect_task(lambda: self._init_fan([conf_fan]))
         msmax = self.microsteps / 2
         self.max_step_size = self.config.getint(
             f'max_step_size_{name}', default=0, minval=1, maxval=msmax)
@@ -552,47 +685,8 @@ class MotionAxis:
             def_steps_model = ['enc_auto', self.move_d]
             self._init_steps_models(def_steps_model)
 
-    def _create_fan_switch(self, method):
-        if method == 'heater_fan':
-            def fan_switch(on=True):
-                if not self.fan:
-                    return
-                now = self.reactor.monotonic()
-                print_time = (self.fan.fan.get_mcu().
-                              estimated_print_time(now))
-                speed = self.fan.last_speed if on else .0
-                self.fan.fan.set_speed(value=speed,
-                    print_time=print_time + PIN_MIN_TIME)
-        elif method == 'temperature_fan':
-            def fan_switch(on=True):
-                if not self.fan:
-                    return
-                if not self.last_fan_target:
-                    self.last_fan_target = self.fan.target_temp
-                target = self.last_fan_target if on else .0
-                self.fan.set_temp(target)
-            self.last_fan_target = 0
-        else:
-            def fan_switch(_):
-                return
-        self.fan_switch = fan_switch
-
-    def _init_fan(self):
-        fan_methods = ['heater_fan', 'temperature_fan']
-        if self.conf_fan is None:
-            # Create a stub
-            self._create_fan_switch(None)
-            return
-        for method in fan_methods:
-            try:
-                self.fan = self.printer.lookup_object(
-                    f'{method} {self.conf_fan}')
-                self._create_fan_switch(method)
-                return
-            except:
-                continue
-        raise self.config.error(f"motors_sync: Unknown fan or "
-                                f"fan method '{self.conf_fan}'")
+    def _init_fan(self, fans):
+        self.fan = self.sync.fan_manager.register_fans(self.name, fans)
 
 
 class MotorsSync:
@@ -604,6 +698,7 @@ class MotorsSync:
         self.stepper_en = self.printer.load_object(config, 'stepper_enable')
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.status = z_tilt.ZAdjustStatus(self.printer)
+        self.fan_manager = FanManager(config)
         self.connect_tasks = []
         # Read config
         self._init_stat_manager()
@@ -839,12 +934,12 @@ class MotorsSync:
             msg = f"{name}-Movement direction: {axis.move_dir[1]}"
         elif state == 'start':
             axis.flush_motion_data()
-            axis.fan_switch(False)
+            axis.fan.toggle(False)
             axis.chip_helper.start_measurements()
             axis.init_magnitude = axis.magnitude = self.measure(axis)
             msg = f"{name}-Initial {dim_type}: {axis.init_magnitude}"
         elif state == 'done':
-            axis.fan_switch(True)
+            axis.fan.toggle(True)
             axis.chip_helper.finish_measurements()
             axis.toggle_main_stepper(1, (PIN_MIN_TIME,)*2)
             axis.update_phase_offset()
@@ -859,7 +954,7 @@ class MotorsSync:
                    f"to reach {axis.retry_tolerance}")
         else:
             for axis in [c for a, c in self.motion.items() if a in self.axes]:
-                axis.fan_switch(True)
+                axis.fan.toggle(True)
                 axis.chip_helper.finish_measurements()
             raise self.gcode.error(state)
         self.gcode.respond_info(msg, True)
@@ -992,7 +1087,7 @@ class MotorsSync:
             for axis in self.axes:
                 m = self.motion[axis]
                 m.chip_helper.finish_measurements()
-                m.fan_switch(True)
+                m.fan.toggle(True)
                 retry_tols += f'{m.name.upper()}: {m.retry_tolerance}, '
             self.gcode.respond_info(f"Motors magnitudes are in "
                                     f"tolerance: {retry_tols}", True)
@@ -1173,7 +1268,7 @@ class MotorsSyncCalibrate:
         # Scale calibration steps to 1/16
         m.move_msteps = m.microsteps // fullstep
         emul_peak_mstep = peak_mstep * m.move_msteps
-        m.fan_switch(False)
+        m.fan.toggle(False)
         m.chip_helper.start_measurements()
         m.toggle_main_stepper(0)
         for r in range(1, repeats + 1):
@@ -1192,7 +1287,7 @@ class MotorsSyncCalibrate:
                     y_samples.append(m.new_magnitude)
         m.magnitude = m.new_magnitude
         # Manual handle_state('done')
-        m.fan_switch(True)
+        m.fan.toggle(True)
         m.chip_helper.finish_measurements()
         m.toggle_main_stepper(1)
         # To array with removed first sample
