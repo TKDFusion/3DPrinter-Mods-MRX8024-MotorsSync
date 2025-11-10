@@ -301,6 +301,32 @@ class FanController:
             print_time=print_time + PIN_MIN_TIME)
 
 
+class ControllerFanController(FanController):
+    def __init__(self, fan, printer):
+        super().__init__(fan, printer)
+        self.fan_speed = None
+        self.idle_speed = None
+        self.last_speed = None
+
+    def _hold(self):
+        self.fan_speed = self.fan.fan_speed
+        self.idle_speed = self.fan.idle_speed
+        self.last_speed = self.fan.last_speed
+        self.fan.fan_speed = 0
+        self.fan.idle_speed = 0
+        self.fan.last_speed = 0
+        self._set_fan_speed(0)
+
+    def _resume(self):
+        self.fan.fan_speed = self.fan_speed
+        self.fan.idle_speed = self.idle_speed
+        self.fan.last_speed = self.last_speed
+        self._set_fan_speed(self.last_speed)
+        self.fan_speed = None
+        self.idle_speed = None
+        self.last_speed = None
+
+
 class HeaterFanController(FanController):
     def __init__(self, fan, printer):
         super().__init__(fan, printer)
@@ -352,12 +378,13 @@ class FanProxy:
 
 
 class FanManager:
-    from . import heater_fan, temperature_fan
+    from . import controller_fan, heater_fan, temperature_fan
     FAN_METHODS = {
+        controller_fan.ControllerFan: ControllerFanController,
         heater_fan.PrinterHeaterFan: HeaterFanController,
         temperature_fan.TemperatureFan: TemperatureFanController,
     }
-    del heater_fan, temperature_fan
+    del controller_fan, heater_fan, temperature_fan
     def __init__(self, config):
         self.printer = config.get_printer()
         self._fans = {}
