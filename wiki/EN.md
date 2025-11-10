@@ -100,7 +100,9 @@ accel_chip:
 #    The maximum number of repetitions to achieve the forced threshold of
 #    oscillations.
 #head_fan:
-#    Toolhead fan, which will be turned off during sync to eliminate noise.
+#    Full name of the toolhead fan that will be turned off during sync to
+#    eliminate its noise. Can be specified multiple fans by separating
+#    their names with commas.
 #axis_prefix_<axis>:
 #    Allows you to set a custom prefix that will be displayed before the
 #    axis name in terminal outputs. You can use special characters or

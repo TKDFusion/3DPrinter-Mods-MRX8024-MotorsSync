@@ -444,10 +444,10 @@ class MotionAxis:
         sync.add_connect_task(self._init_steppers)
         sync.add_connect_task(self._init_tmc_drivers)
         self._init_chip_helper()
-        conf_fan = self.config.get(f'head_fan_{name}', '')
-        if not conf_fan:
-            conf_fan = self.config.get('head_fan', None)
-        sync.add_connect_task(lambda: self._init_fan([conf_fan]))
+        conf_fans = self.config.getlist(f'head_fan_{name}', '')
+        if not conf_fans:
+            conf_fans = self.config.getlist('head_fan', [])
+        sync.add_connect_task(lambda: self._init_fan(conf_fans))
         msmax = self.microsteps / 2
         self.max_step_size = self.config.getint(
             f'max_step_size_{name}', default=0, minval=1, maxval=msmax)
