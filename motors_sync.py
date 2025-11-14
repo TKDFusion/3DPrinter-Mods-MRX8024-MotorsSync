@@ -31,85 +31,140 @@ MATH_MODELS = {
     "enc_auto": lambda fx, coeffs: (fx / 1e3 / coeffs[0])
 }
 
-class AccelHelper:
-    AXES_LEVEL_DELTA = 2000
-    ACCEL_FILTER_THRESHOLD = 3000
+class BaseSensorHelper:
     def __init__(self, axis, chip_name):
         self.axis = axis
         self.sync = axis.sync
         self.chip_name = chip_name
-        self.chip_type = 'accelerometer'
-        self.dim_type = 'magnitude'
-        self.config = self.sync.config
+        self.dim_type = ''
         self.printer = self.sync.printer
-        self.aclient = None
-        self.chip_filter = None
-        self.init_chip_config(chip_name)
-        axis.calc_deviation = self._calc_magnitude
-        axis.detect_move_dir = self._detect_move_dir
+        self.chip_config = None
+        self.sync.add_connect_task(self._handle_connect)
         self.gcode = self.printer.lookup_object('gcode')
-        self.toolhead = self.printer.lookup_object('toolhead')
         self.reactor = self.printer.get_reactor()
+        self.is_finished = False
+        self.samples = []
+        self.request_start_time = None
+        self.request_end_time = None
 
-    def init_chip_config(self, chip_name):
-        self.accel_config = self.printer.lookup_object(chip_name)
-        if hasattr(self.accel_config, 'data_rate'):
-            if self.accel_config.data_rate > self.ACCEL_FILTER_THRESHOLD:
-                self.axis._init_chip_filter()
-            else:
-                self.chip_filter = lambda data: data
-        elif chip_name == 'beacon':
-            # Beacon sampling rate > ACCEL_FILTER_THRESHOLD
-            self.axis._init_chip_filter()
-        else:
-            raise self.config.error(f"motors_sync: Unknown accelerometer"
-                                    f" '{chip_name}' sampling rate")
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.chip_config = self.printer.lookup_object(self.chip_name)
 
     def flush_data(self):
-        self.aclient.is_finished = False
-        self.aclient.msgs.clear()
-        self.aclient.request_start_time = None
-        self.aclient.request_end_time = None
+        self.is_finished = False
+        self.samples.clear()
+        self.request_start_time = None
+        self.request_end_time = None
+
+    def _handle_batch(self, batch):
+        if self.is_finished:
+            return False
+        samples = batch['data']
+        self.samples.extend(samples)
+        return True
 
     def update_start_time(self):
-        self.aclient.request_start_time = self.toolhead.get_last_move_time()
+        self.request_start_time = self.toolhead.get_last_move_time()
 
     def update_end_time(self):
-        self.aclient.request_end_time = self.toolhead.get_last_move_time()
+        self.request_end_time = self.toolhead.get_last_move_time()
 
     def start_measurements(self):
-        self.aclient = self.accel_config.start_internal_client()
+        self.flush_data()
+        self.chip_config.batch_bulk.add_client(self._handle_batch)
 
     def finish_measurements(self):
-        self.aclient.finish_measurements()
+        self.toolhead.wait_moves()
+        self.is_finished = True
 
     def _wait_samples(self):
         lim = self.reactor.monotonic() + 5.
         while True:
             now = self.reactor.monotonic()
             self.reactor.pause(now + 0.010)
-            if self.aclient.msgs and self.aclient.request_end_time:
-                last_mcu_time = self.aclient.msgs[-1]['data'][-1][0]
-                if last_mcu_time > self.aclient.request_end_time:
+            if self.samples and self.request_end_time:
+                last_mcu_time = self.samples[-1][0]
+                if last_mcu_time > self.request_end_time:
                     return True
                 elif now > lim:
                     raise self.gcode.error(
-                        'motors_sync: No data from accelerometer')
+                        'motors_sync: No data from sensor')
 
-    def _get_accel_samples(self):
+    def _get_samples(self):
         self._wait_samples()
-        raw_data = np.concatenate(
-            [np.array(m['data']) for m in self.aclient.msgs])
+        raw_data = np.array(self.samples)
         start_idx = np.searchsorted(raw_data[:, 0],
-                    self.aclient.request_start_time, side='left')
+                    self.request_start_time, side='left')
         end_idx = np.searchsorted(raw_data[:, 0],
-                    self.aclient.request_end_time, side='right')
-        t_accels = raw_data[start_idx:end_idx]
-        return t_accels[:, 1:]
+                    self.request_end_time, side='right')
+        return raw_data[start_idx:end_idx][:, 1:]
 
-    def _calc_magnitude(self):
+    def calc_deviation(self):
+        raise
+
+    def _detect_move_dir(self):
+        raise
+
+
+class AccelHelper(BaseSensorHelper):
+    ACCEL_FILTER_THRESHOLD = 3000
+    def __init__(self, axis, chip_name):
+        super().__init__(axis, chip_name)
+        self.dim_type = 'magnitude'
+        self.chip_filter = None
+        self._init_chip_filter()
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.init_chip_config(self.chip_name)
+
+    def _init_chip_filter(self):
+        config = self.sync.config
+        filters = {m: m for m in ['default', 'median', 'kalman']}
+        filter = config.getchoice(f'chip_filter_{self.axis.name}',
+                                  filters, 'default').lower()
+        if filter == 'default':
+            filter = config.getchoice('chip_filter',
+                                      filters, 'median').lower()
+        if filter == 'median':
+            window = config.getint(f'median_size_{self.axis.name}',
+                                   '', minval=3, maxval=9)
+            if not window:
+                window = config.getint('median_size', default=3,
+                                       minval=3, maxval=9)
+            if window % 2 == 0: raise config.error(
+                f"motors_sync: parameter 'median_size' cannot be even")
+            self.chip_filter = lambda samples, w=window: (
+                np.median([samples[i - w:i + w + 1]
+                           for i in range(w, len(samples) - w)], axis=1))
+        elif filter == 'kalman':
+            coeffs = config.getfloatlist(
+                f'kalman_coeffs_{self.axis.name}',
+                default=tuple('' for _ in range(6)), count=6)
+            if not all(coeffs):
+                coeffs = config.getfloatlist('kalman_coeffs',
+                    default=tuple((1.1, 1., 1e-1, 1e-2, .5, 1.)), count=6)
+            self.chip_filter = KalmanLiteFilter(*coeffs).process_samples
+
+    def init_chip_config(self, chip_name):
+        self.chip_config = self.printer.lookup_object(chip_name)
+        if hasattr(self.chip_config, 'data_rate'):
+            if self.chip_config.data_rate > self.ACCEL_FILTER_THRESHOLD:
+                self._init_chip_filter()
+            else:
+                self.chip_filter = lambda data: data
+        elif chip_name == 'beacon':
+            # Beacon sampling rate > ACCEL_FILTER_THRESHOLD
+            self._init_chip_filter()
+        else:
+            raise self.printer.config_error(
+                f"motors_sync: Unknown accelerometer "
+                f"'{chip_name}' sampling rate")
+
+    def calc_deviation(self):
         # Calculate impact magnitude
-        vects = self._get_accel_samples()
+        vects = self._get_samples()
         vects_len = vects.shape[0]
         # Kalman filter may distort the first values, or in some
         # cases there may be residual values of toolhead inertia.
@@ -130,7 +185,7 @@ class AccelHelper:
         return magnitude
 
     def _detect_move_dir(self):
-        # Determine movement direction
+        # Determine axis movement direction
         self.axis.move_dir = [1, 'unknown']
         self.sync.single_move(self.axis)
         self.axis.new_magnitude = self.sync.measure(self.axis)
@@ -143,108 +198,46 @@ class AccelHelper:
         self.axis.magnitude = self.axis.new_magnitude
 
 
-class EncoderHelper:
-    AXES_LEVEL_DELTA = 5
+class EncoderHelper(BaseSensorHelper):
     MIN_SAMPLE_PERIOD = 0.000400
     def __init__(self, axis, chip_name):
-        self.axis = axis
-        self.sync = axis.sync
-        self.chip_name = 'angle ' + chip_name
-        self.chip_type = 'encoder'
+        super().__init__(axis, chip_name)
         self.dim_type = 'deviation'
-        self.config = self.sync.config
-        self.printer = self.sync.printer
-        self.angle_config = self.printer.lookup_object(self.chip_name)
+        self.last_raw_deviation = 0
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.chip_config = self.printer.lookup_object(self.chip_name)
         self._check_sample_rate()
         self._check_encoder_place()
-        self.is_finished = False
-        self.samples = []
-        self.raw_deviation = 0
-        self.request_start_time = None
-        self.request_end_time = None
-        axis.calc_deviation = self._calc_position
-        axis.detect_move_dir = self._detect_move_dir
-        self.gcode = self.printer.lookup_object('gcode')
-        self.toolhead = self.printer.lookup_object('toolhead')
-        self.reactor = self.printer.get_reactor()
 
     def _check_sample_rate(self):
-        per = self.angle_config.sample_period
+        per = self.chip_config.sample_period
         if per > self.MIN_SAMPLE_PERIOD:
-            raise self.config.error(
+            raise self.printer.config_error(
                 f'motors_sync: Encoder sample rate too '
                 f'low: {per} < {self.MIN_SAMPLE_PERIOD}')
 
     def _check_encoder_place(self):
         # Swap duties between motors depending on encoder place
-        binded_stepper = self.angle_config.calibration.stepper_name
+        binded_stepper = self.chip_config.calibration.stepper_name
         axis_steppers = [s.get_name() for s in self.axis.get_steppers()]
         if binded_stepper not in axis_steppers:
-            raise self.config.error(
+            raise self.printer.config_error(
                 f"motors_sync: Encoder '{self.chip_name}' stepper: "
                 f"'{binded_stepper}' not in '{self.axis.name}' "
                 f"axis steppers: '{', '.join(axis_steppers)}'")
         if binded_stepper != axis_steppers[0]:
             self.axis.swap_steppers()
 
-    def handle_batch(self, batch):
-        if self.is_finished:
-            return False
-        samples = batch['data']
-        self.samples.extend(samples)
-        return True
-
-    def flush_data(self):
-        self.is_finished = False
-        self.samples.clear()
-        self.request_start_time = None
-        self.request_end_time = None
-
-    def update_start_time(self):
-        self.request_start_time = self.toolhead.get_last_move_time()
-
-    def update_end_time(self):
-        self.request_end_time = self.toolhead.get_last_move_time()
-
-    def start_measurements(self):
-        self.flush_data()
-        self.angle_config.add_client(self.handle_batch)
-
-    def finish_measurements(self):
-        self.toolhead.wait_moves()
-        self.is_finished = True
-
-    def _wait_samples(self):
-        lim = self.reactor.monotonic() + 5.
-        while True:
-            now = self.reactor.monotonic()
-            self.reactor.pause(now + 0.010)
-            if self.samples and self.request_end_time:
-                last_mcu_time = self.samples[-1][0]
-                if last_mcu_time > self.request_end_time:
-                    return True
-                elif now > lim:
-                    raise self.gcode.error(
-                        'motors_sync: No data from encoder')
-
-    def _get_encoder_samples(self):
-        self._wait_samples()
-        raw_data = np.array(self.samples)
-        start_idx = np.searchsorted(raw_data[:, 0],
-                    self.request_start_time, side='left')
-        end_idx = np.searchsorted(raw_data[:, 0],
-                    self.request_end_time, side='right')
-        t_accels = raw_data[start_idx:end_idx]
-        return t_accels[:, 1]
-
-    def normalize_encoder_pos(self, pos):
+    def _normalize_encoder_pos(self, pos):
         angle = (1 << 16) / pos
         length = self.axis.rd / angle
         return angle, length
 
-    def _calc_position(self):
-        # Calculate impact position µm on encoder
-        positions = self._get_encoder_samples()
+    def calc_deviation(self):
+        # Calculate impact position on encoder in µm
+        positions = self._get_samples()[:, 0]
         poss_len = positions.shape[0]
         static_zone = range(poss_len // 5, poss_len // 3)
         # Calculate static position
@@ -253,16 +246,16 @@ class EncoderHelper:
         deviations = positions - static
         top_dev_ids = np.argsort(np.abs(deviations))[-5:]
         deviation = np.mean(deviations[top_dev_ids])
-        dev_norm = self.normalize_encoder_pos(deviation)
+        dev_norm = self._normalize_encoder_pos(deviation)
         deviation = np.around(dev_norm[1] * 1e3, 2)
         abs_deviation = abs(deviation)
         self.axis.update_log(int(abs_deviation))
-        self.raw_deviation = deviation
+        self.last_raw_deviation = deviation
         return abs_deviation
 
     def _detect_move_dir(self):
-        # Determine movement direction
-        if self.raw_deviation < 0:
+        # Determine axis movement direction
+        if self.last_raw_deviation < 0:
             self.axis.move_dir = [-1, 'Backward']
         else:
             self.axis.move_dir = [1, 'Forward']
@@ -573,6 +566,9 @@ class MotionAxis:
         for name in self.joint_axes:
             self.sync.motion[name].toggle_steppers(mode)
 
+    def detect_move_dir(self):
+        self.chip_helper._detect_move_dir()
+
     def update_log(self, deviation):
         self.log.append([int(deviation), self.actual_msteps])
 
@@ -652,40 +648,6 @@ class MotionAxis:
             return res * model_scale
         self.model_solve = model_solve
 
-    def _init_chip_filter(self):
-        filters = ['default', 'median', 'kalman']
-        filters_d = {m: m for m in filters}
-        filter = self.config.getchoice(f'chip_filter_{self.name}',
-                                       filters_d, 'default').lower()
-        if filter == 'default':
-            filter = self.config.getchoice('chip_filter',
-                                           filters_d, 'median').lower()
-        if filter == 'median':
-            window = self.config.getint(f'median_size_{self.name}',
-                                        '', minval=3, maxval=9)
-            if not window:
-                window = self.config.getint('median_size', default=3,
-                                            minval=3, maxval=9)
-            if window % 2 == 0: raise self.config.error(
-                f"motors_sync: parameter 'median_size' cannot be even")
-            chip_filter = lambda samples, w=window: np.median(
-                [samples[i - w:i + w + 1]
-                 for i in range(w, len(samples) - w)], axis=1)
-        elif filter == 'kalman':
-            coeffs = self.config.getfloatlist(
-                f'kalman_coeffs_{self.name}',
-                default=tuple('' for _ in range(6)), count=6)
-            if not all(coeffs):
-                coeffs = self.config.getfloatlist('kalman_coeffs',
-                    default=tuple((1.1, 1., 1e-1, 1e-2, .5, 1.)), count=6)
-            chip_filter = KalmanLiteFilter(*coeffs).process_samples
-        # If chip_helper is not init, defer the task to klippy connect state
-        if hasattr(self, 'chip_helper'):
-            self.chip_helper.chip_filter = chip_filter
-        else:
-            self.sync.add_connect_task(lambda: setattr(
-                self.chip_helper, 'chip_filter', chip_filter))
-
     def _init_chip_helper(self):
         accel_chip_name = self.config.get(f'accel_chip_{self.name}', '')
         enc_chip_name = self.config.get(f'encoder_chip_{self.name}', '')
@@ -699,18 +661,14 @@ class MotionAxis:
                 f"motors_sync: Sensors type 'accel_chip' or "
                 f"'encoder_chip_<axis>' must be provided")
         if accel_chip_name:
-            # Init accelerometer config on klippy connect
-            self.sync.add_connect_task(lambda: setattr(self,
-                'chip_helper', AccelHelper(self, accel_chip_name)))
-            self._init_chip_filter()
+            self.chip_helper = AccelHelper(self, accel_chip_name)
             def_steps_model = ['linear', 20000, 0]
-            self._init_steps_models(def_steps_model)
         elif enc_chip_name:
-            # Init encoder config on klippy connect
-            self.sync.add_connect_task(lambda: setattr(self,
-                'chip_helper', EncoderHelper(self, enc_chip_name)))
+            self.chip_helper = EncoderHelper(self, enc_chip_name)
             def_steps_model = ['enc_auto', self.move_d]
-            self._init_steps_models(def_steps_model)
+        else:
+            raise
+        self._init_steps_models(def_steps_model)
 
     def _init_fan(self, fans):
         self.fan = self.sync.fan_manager.register_fans(self.name, fans)
@@ -774,9 +732,6 @@ class MotorsSync:
         for attr in common_attr:
             diff = set([getattr(cls, attr) for cls in self.motion.values()])
             if len(diff) < 2:
-                continue
-            if (attr == 'chip_name' and list(self.motion.values())[0]
-                 .chip_helper.chip_type == 'encoder'):
                 continue
             params_str = ', '.join(f"'{attr}: {v}'" for v in diff)
             raise self.config.error(
@@ -934,7 +889,7 @@ class MotorsSync:
             self.buzz(axis, 5)
         else:
             axis.toggle_main_stepper(0)
-        return axis.calc_deviation()
+        return axis.chip_helper.calc_deviation()
 
     def homing(self):
         # Homing and going to center
@@ -1078,7 +1033,7 @@ class MotorsSync:
         chip = gcmd.get(f'ACCEL_CHIP', '')
         for axis in self.axes:
             m = self.motion[axis]
-            if m.chip_helper.chip_type != 'accelerometer':
+            if not isinstance(m.chip_helper, AccelHelper):
                 continue
             ax_chip = gcmd.get(f'ACCEL_CHIP_{axis.upper()}', chip)
             if ax_chip and ax_chip != m.chip_helper.chip_name:
