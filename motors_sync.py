@@ -6,6 +6,7 @@
 import os, logging, time, itertools
 from datetime import datetime
 import numpy as np
+import chelper
 from . import z_tilt
 
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
@@ -30,6 +31,53 @@ MATH_MODELS = {
         np.log((fx - coeffs[2]) / coeffs[0]) / coeffs[1],
     "enc_auto": lambda fx, coeffs: (fx / 1e3 / coeffs[0])
 }
+
+class StepperManualMove:
+    from . import force_move
+    calc_move_time = staticmethod(force_move.calc_move_time)
+    del force_move
+    def __init__(self, sync, config):
+        self.printer = config.get_printer()
+        self.motion_queuing = \
+            self.printer.load_object(config, 'motion_queuing')
+        self.trapq = self.motion_queuing.allocate_trapq()
+        self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.stepper_kin = ffi_main.gc(
+            ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
+        sync.add_connect_task(self._handle_connect)
+        self.travel_speed = None
+        self.travel_accel = None
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.travel_speed = min(self.toolhead.max_velocity, 100)
+        self.travel_accel = min(self.toolhead.max_accel, 5000)
+
+    def manual_move(self, mcu_stepper, moves):
+        self.toolhead.flush_step_generation()
+        prev_sk = mcu_stepper.set_stepper_kinematics(self.stepper_kin)
+        prev_trapq = mcu_stepper.set_trapq(self.trapq)
+        mcu_stepper.set_position((0., 0., 0.))
+        ptime = start_ptime = self.toolhead.get_last_move_time()
+        last_pos = 0
+        for move in moves:
+            if abs(move) < 0.00001:
+                continue
+            axis_r, accel_t, cruise_t, cruise_v = self.calc_move_time(
+                move, self.travel_speed, self.travel_accel)
+            self.trapq_append(
+                self.trapq, ptime, accel_t, cruise_t, accel_t, last_pos,
+                0., 0., axis_r, 0., 0., 0., cruise_v, self.travel_accel)
+            ptime = ptime + accel_t + cruise_t + accel_t
+            last_pos += move
+        self.motion_queuing.note_mcu_movequeue_activity(ptime)
+        self.toolhead.dwell(ptime - start_ptime)
+        self.toolhead.flush_step_generation()
+        mcu_stepper.set_trapq(prev_trapq)
+        mcu_stepper.set_stepper_kinematics(prev_sk)
+        self.motion_queuing.wipe_trapq(self.trapq)
+
 
 class BaseSensorHelper:
     def __init__(self, axis, chip_name):
@@ -540,12 +588,12 @@ class MotionAxis:
             return
         if self.phase_offset is None:
             return
-        mode_d = self.phase_offset / 256 * self.move_d * self.microsteps
-        if abs(mode_d) < self.move_d * 2:
+        move_d = self.phase_offset / 256 * self.move_d * self.microsteps
+        if abs(move_d) < self.move_d * 2:
             return
         self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
-        self.sync.stepper_move(self.steppers[1], mode_d)
-        msteps = int(mode_d // self.move_d)
+        self.sync.stepper_move.manual_move(self.steppers[1], [move_d])
+        msteps = int(move_d // self.move_d)
         self.gcode.respond_info(
             f'{self.name.upper()}-Restore previous '
             f'position: {msteps}/{self.microsteps} step')
@@ -679,12 +727,12 @@ class MotorsSync:
         self.config = config
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
-        self.force_move = self.printer.load_object(config, 'force_move')
         self.stepper_en = self.printer.load_object(config, 'stepper_enable')
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.status = z_tilt.ZAdjustStatus(self.printer)
-        self.fan_manager = FanManager(config)
         self.connect_tasks = []
+        self.stepper_move = StepperManualMove(self, config)
+        self.fan_manager = FanManager(config)
         # Read config
         self._init_stat_manager()
         self._init_axes()
@@ -848,10 +896,6 @@ class MotorsSync:
             else el.motor_disable(print_time)
         self.toolhead.dwell(offtime)
 
-    def stepper_move(self, mcu_stepper, dist):
-        self.force_move.manual_move(mcu_stepper, dist,
-            self.travel_speed, self.travel_accel)
-
     def single_move(self, axis, mcu_stepper=None, dir=1):
         # Move <axis>1 stepper motor by default
         if mcu_stepper is None:
@@ -860,20 +904,21 @@ class MotorsSync:
         dist = axis.move_d * move_msteps
         axis.actual_msteps += move_msteps
         axis.check_msteps += move_msteps
-        self.stepper_move(mcu_stepper, dist)
+        self.stepper_move.manual_move(mcu_stepper, [dist])
 
     def buzz(self, axis, rel_moves=25):
         # Fading oscillations by <axis>1 stepper
-        mcu_stepper1 = axis.get_steppers()[1]
+        moves = []
         last_abs_pos = 0
-        axis.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
         for osc in reversed(range(0, rel_moves)):
             abs_pos = axis.rel_buzz_d * (osc / rel_moves)
             for inv in [1, -1]:
                 abs_pos *= inv
                 dist = (abs_pos - last_abs_pos)
+                moves.append(dist)
                 last_abs_pos = abs_pos
-                self.stepper_move(mcu_stepper1, dist)
+        axis.toggle_main_stepper(0, (PIN_MIN_TIME,) * 2)
+        self.stepper_move.manual_move(axis.get_steppers()[1], moves)
 
     def measure(self, axis):
         # Measure the impact
@@ -1257,7 +1302,8 @@ class MotorsSyncCalibrate:
             self.gcode.respond_info(
                 f'Repeats: {r}/{repeats} Move to +-'
                 f'{emul_peak_mstep}/{m.microsteps} microstep')
-            self.sync.stepper_move(mcu_stepper1, next(looped_pos))
+            self.sync.stepper_move.manual_move(
+                mcu_stepper1, [next(looped_pos)])
             for inv in invs:
                 m.move_dir[0] = inv
                 for _ in range(peak_mstep):
