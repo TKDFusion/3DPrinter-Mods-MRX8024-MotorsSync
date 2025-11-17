@@ -32,6 +32,36 @@ MATH_MODELS = {
     "enc_auto": lambda fx, coeffs: (fx / 1e3 / coeffs[0])
 }
 
+# Plug class for the Klipper version before add "motion_queuing"
+# module, and probably also for Kalico. May the gods forgive me.
+class DummyPrinterMotionQueuing:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
+        self.trapq_append = ffi_lib.trapq_append
+        self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+
+    def allocate_trapq(self):
+        return self.trapq
+
+    def lookup_trapq_append(self):
+        return self.trapq_append
+
+    def note_mcu_movequeue_activity(self, ptime):
+        ctime = ptime + 99999.9
+        self.trapq_finalize_moves(self.trapq, ctime, ctime)
+        self.toolhead.note_mcu_movequeue_activity(ptime)
+
+    def wipe_trapq(self, trapq):
+        return
+
+
 class StepperManualMove:
     from . import force_move
     calc_move_time = staticmethod(force_move.calc_move_time)
@@ -39,7 +69,9 @@ class StepperManualMove:
     def __init__(self, sync, config):
         self.printer = config.get_printer()
         self.motion_queuing = \
-            self.printer.load_object(config, 'motion_queuing')
+            self.printer.load_object(config, 'motion_queuing', None)
+        if self.motion_queuing is None:
+            self.motion_queuing = DummyPrinterMotionQueuing(config)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -60,7 +92,7 @@ class StepperManualMove:
         prev_trapq = mcu_stepper.set_trapq(self.trapq)
         mcu_stepper.set_position((0., 0., 0.))
         ptime = start_ptime = self.toolhead.get_last_move_time()
-        last_pos = 0
+        last_pos = 0.0
         for move in moves:
             if abs(move) < 0.00001:
                 continue
@@ -71,6 +103,8 @@ class StepperManualMove:
                 0., 0., axis_r, 0., 0., 0., cruise_v, self.travel_accel)
             ptime = ptime + accel_t + cruise_t + accel_t
             last_pos += move
+        if hasattr(mcu_stepper, 'generate_steps'):
+            mcu_stepper.generate_steps(ptime)
         self.motion_queuing.note_mcu_movequeue_activity(ptime)
         self.toolhead.dwell(ptime - start_ptime)
         self.toolhead.flush_step_generation()
