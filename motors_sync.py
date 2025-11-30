@@ -121,17 +121,27 @@ class BaseSensorHelper:
         self.dim_type = ''
         self.printer = self.sync.printer
         self.chip_config = None
-        self.sync.add_connect_task(self._handle_connect)
         self.gcode = self.printer.lookup_object('gcode')
         self.reactor = self.printer.get_reactor()
         self.is_finished = False
         self.samples = []
         self.request_start_time = None
         self.request_end_time = None
+        self._run_on_connect(self._handle_connect)
+        self._run_on_connect(self._init_chip_config)
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
+
+    def _init_chip_config(self):
         self.chip_config = self.printer.lookup_object(self.chip_name)
+
+    def _run_on_connect(self, task):
+        _, state = self.printer.get_state_message()
+        if state == "ready":
+            task()
+        else:
+            self.printer.register_event_handler("klippy:connect", task)
 
     def flush_data(self):
         self.is_finished = False
@@ -192,16 +202,12 @@ class BaseSensorHelper:
 class AccelHelper(BaseSensorHelper):
     ACCEL_FILTER_THRESHOLD = 3000
     def __init__(self, axis, chip_name):
+        self.chip_filter = None
         super().__init__(axis, chip_name)
         self.dim_type = 'magnitude'
-        self.chip_filter = None
-        self._init_chip_filter()
+        self._init_chip_filter(only_read=True)
 
-    def _handle_connect(self):
-        self.toolhead = self.printer.lookup_object('toolhead')
-        self.init_chip_config(self.chip_name)
-
-    def _init_chip_filter(self):
+    def _init_chip_filter(self, only_read=False):
         config = self.sync.config
         filters = {m: m for m in ['default', 'median', 'kalman']}
         filter = config.getchoice(f'chip_filter_{self.axis.name}',
@@ -217,6 +223,8 @@ class AccelHelper(BaseSensorHelper):
                                        minval=3, maxval=9)
             if window % 2 == 0: raise config.error(
                 f"motors_sync: parameter 'median_size' cannot be even")
+            if only_read:
+                return
             self.chip_filter = lambda samples, w=window: (
                 np.median([samples[i - w:i + w + 1]
                            for i in range(w, len(samples) - w)], axis=1))
@@ -227,22 +235,16 @@ class AccelHelper(BaseSensorHelper):
             if not all(coeffs):
                 coeffs = config.getfloatlist('kalman_coeffs',
                     default=tuple((1.1, 1., 1e-1, 1e-2, .5, 1.)), count=6)
+                if only_read:
+                    return
             self.chip_filter = KalmanLiteFilter(*coeffs).process_samples
 
-    def init_chip_config(self, chip_name):
-        self.chip_config = self.printer.lookup_object(chip_name)
-        if hasattr(self.chip_config, 'data_rate'):
-            if self.chip_config.data_rate > self.ACCEL_FILTER_THRESHOLD:
-                self._init_chip_filter()
-            else:
-                self.chip_filter = lambda data: data
-        elif chip_name == 'beacon':
-            # Beacon sampling rate > ACCEL_FILTER_THRESHOLD
+    def _init_chip_config(self):
+        self.chip_config = self.printer.lookup_object(self.chip_name)
+        if self.chip_config.data_rate > self.ACCEL_FILTER_THRESHOLD:
             self._init_chip_filter()
         else:
-            raise self.printer.config_error(
-                f"motors_sync: Unknown accelerometer "
-                f"'{chip_name}' sampling rate")
+            self.chip_filter = lambda data: data
 
     def calc_deviation(self):
         # Calculate impact magnitude
@@ -280,6 +282,27 @@ class AccelHelper(BaseSensorHelper):
         self.axis.magnitude = self.axis.new_magnitude
 
 
+class BeaconAccelHelper(AccelHelper):
+    def __init__(self, axis, chip_name):
+        super().__init__(axis, chip_name)
+
+    def _init_chip_config(self):
+        beacon = self.printer.lookup_object(self.chip_name)
+        # Beacon "chip_config" is "beacon.accel_helper"
+        self.chip_config = beacon.accel_helper
+        # Beacon use self-written "batch_bulk" named as "_api_dump"
+        self.chip_config.batch_bulk = self.chip_config._api_dump
+        # Beacon module doesn't have "data_rate" attribute
+        # Beacon adxl345 sampling rate > ACCEL_FILTER_THRESHOLD
+        self._init_chip_filter()
+
+    def _handle_batch(self, batches):
+        hb = super()._handle_batch
+        for batch in batches:
+            res = hb(batch)
+        return res
+
+
 class EncoderHelper(BaseSensorHelper):
     MIN_SAMPLE_PERIOD = 0.000400
     def __init__(self, axis, chip_name):
@@ -287,8 +310,7 @@ class EncoderHelper(BaseSensorHelper):
         self.dim_type = 'deviation'
         self.last_raw_deviation = 0
 
-    def _handle_connect(self):
-        self.toolhead = self.printer.lookup_object('toolhead')
+    def _init_chip_config(self):
         self.chip_config = self.printer.lookup_object(self.chip_name)
         self._check_sample_rate()
         self._check_encoder_place()
@@ -526,6 +548,7 @@ class MotionAxis:
         self.new_magnitude = 0.
         self.curr_retry = 0
         self.is_finished = False
+        self.chip_helper = None
         self.log = []
         stepper = 'stepper_' + name
         st_section = self.config.getsection(stepper)
@@ -730,6 +753,14 @@ class MotionAxis:
             return res * model_scale
         self.model_solve = model_solve
 
+    def init_accel_chip_helper(self, accel_chip_name):
+        if isinstance(self.chip_helper, BaseSensorHelper):
+            self.chip_helper.finish_measurements()
+        if accel_chip_name == 'beacon':
+            self.chip_helper = BeaconAccelHelper(self, accel_chip_name)
+        else:
+            self.chip_helper = AccelHelper(self, accel_chip_name)
+
     def _init_chip_helper(self):
         accel_chip_name = self.config.get(f'accel_chip_{self.name}', '')
         enc_chip_name = self.config.get(f'encoder_chip_{self.name}', '')
@@ -743,7 +774,7 @@ class MotionAxis:
                 f"motors_sync: Sensors type 'accel_chip' or "
                 f"'encoder_chip_<axis>' must be provided")
         if accel_chip_name:
-            self.chip_helper = AccelHelper(self, accel_chip_name)
+            self.init_accel_chip_helper(accel_chip_name)
             def_steps_model = ['linear', 20000, 0]
         elif enc_chip_name:
             self.chip_helper = EncoderHelper(self, enc_chip_name)
@@ -1117,10 +1148,9 @@ class MotorsSync:
             ax_chip = gcmd.get(f'ACCEL_CHIP_{axis.upper()}', chip)
             if ax_chip and ax_chip != m.chip_helper.chip_name:
                 try:
-                    self.printer.lookup_object(ax_chip)
+                    m.init_accel_chip_helper(ax_chip)
                 except Exception as e:
                     raise self.gcode.error(e)
-                self.motion[axis].chip_helper.init_chip_config(ax_chip)
             retry_tol = gcmd.get_int(f'RETRY_TOLERANCE_{axis.upper()}', 0)
             if not retry_tol:
                 retry_tol = gcmd.get_int(f'RETRY_TOLERANCE', 0)
