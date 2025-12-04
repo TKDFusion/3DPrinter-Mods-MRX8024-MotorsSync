@@ -549,7 +549,7 @@ class MotionAxis:
         self.curr_retry = 0
         self.is_finished = False
         self.chip_helper = None
-        self.log = []
+        self.motion_log = []
         stepper = 'stepper_' + name
         st_section = self.config.getsection(stepper)
         min_pos = st_section.getfloat('position_min', 0)
@@ -610,7 +610,7 @@ class MotionAxis:
         self.new_magnitude = 0.
         self.curr_retry = 0
         self.is_finished = False
-        self.log = []
+        self.motion_log = []
 
     def swap_steppers(self):
         self.steppers.reverse()
@@ -675,7 +675,10 @@ class MotionAxis:
         self.chip_helper._detect_move_dir()
 
     def update_log(self, deviation):
-        self.log.append([int(deviation), self.actual_msteps])
+        self.motion_log.append([int(deviation), self.actual_msteps])
+
+    def write_log(self, state):
+        self.sync.stats_helper.write_axis_stats_log(self, state)
 
     def _init_steppers(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
@@ -798,8 +801,8 @@ class MotorsSync:
         self.connect_tasks = []
         self.stepper_move = StepperManualMove(self, config)
         self.fan_manager = FanManager(config)
+        self.stats_helper = MotionAxesStats(config)
         # Read config
-        self._init_stat_manager()
         self._init_axes()
         self._init_sync_method()
         # Register commands
@@ -821,22 +824,6 @@ class MotorsSync:
         self.kin = self.toolhead.get_kinematics()
         for task in self.connect_tasks: task()
         self.connect_tasks.clear()
-
-    def _init_axes_phase_offset(self, axes):
-        raw_log = self.log_chelper.read_log()
-        if raw_log.size == 0:
-            return {}
-        log = self.log_chelper.parse_raw_log(raw_log)
-        a = {}
-        for p in log[::-1]:
-            if all(ax in a for ax in axes):
-                return a
-            if p[0] in a:
-                continue
-            if not p[1]:
-                continue
-            a[p[0]] = p[6]
-        return a
 
     def _check_common_attr(self):
         # Apply restrictions for LEVELING_KINEMATICS kinematics
@@ -870,7 +857,7 @@ class MotorsSync:
         if any(axis not in valid_axes for axis in axes):
             raise self.config.error(f"motors_sync: Invalid axes "
                                     f"parameter '{','.join(axes)}'")
-        ph_off = self._init_axes_phase_offset(axes)
+        ph_off = self.stats_helper.get_axes_phase_offsets(axes)
         logging.info(f'motors_sync_phase_offset: {ph_off}')
         self.motion = {ax: MotionAxis(self, ax, joint_ax, ph_off)
                        for ax in axes}
@@ -886,69 +873,6 @@ class MotorsSync:
             self.sync_method = 'synchronous'
         else:
             self.sync_method = 'sequential'
-
-    def _init_stat_manager(self):
-        command = 'SYNC_MOTORS_STATS'
-        filename = 'sync_stats.csv'
-        format = 'axis,status,magnitudes,steps,msteps,retries,offset,date,'
-        def log_parser(log):
-            a = {}
-            out = []
-            for p in log:
-                a.setdefault(p[0], {
-                    'count': 0,
-                    'success': 0,
-                    'msteps': 0,
-                    'magnitudes': [0., 0., 0., 999999.],
-                    'retries': 0,
-                })
-                a[p[0]]['count'] += 1
-                if p[1]:
-                    a[p[0]]['success'] += 1
-                a[p[0]]['magnitudes'][:2] = (np.add(
-                    a[p[0]]['magnitudes'][:2], (p[2][-2], p[2][0])))
-                if p[2].max() > a[p[0]]['magnitudes'][2]:
-                    a[p[0]]['magnitudes'][2] = p[2].max()
-                if p[2].min() < a[p[0]]['magnitudes'][3]:
-                    a[p[0]]['magnitudes'][3] = p[2].min()
-                a[p[0]]['msteps'] += abs(p[3][-2] / (p[4] / 16))
-                a[p[0]]['retries'] += p[5]
-            for axis, a in a.items():
-                cf_microsteps = self.motion[axis.lower()].microsteps
-                st_microsteps = a['msteps'] / a['count'] * (cf_microsteps / 16)
-                out.append(f"""
-                {axis.upper()} axis statistics:
-                Successfully synced:     {a['success'] / a['count'] * 100:.2f}%
-                Average start magnitude: {a['magnitudes'][1] / a['count']:.2f}
-                Average end magnitude:   {a['magnitudes'][0] / a['count']:.2f}
-                Average msteps count:    {st_microsteps:.0f}/{cf_microsteps}
-                Average retries count:   {a['retries'] / a['count']:.2f}
-                Min detected magnitude:  {a['magnitudes'][3]:.2f}
-                Max detected magnitude:  {a['magnitudes'][2]:.2f}
-                Synchronization count:   {a['count']}
-                """)
-                out.append('')
-            return out
-        manager = StatisticsManager(self.gcode, command,
-                                    filename, log_parser, format)
-        def write_log(axis=None):
-            if manager.error:
-                return
-            status = axis is None
-            for axis in ([axis] if axis else [
-                 a for n, a in self.motion.items() if n in self.axes]):
-                if not axis.actual_msteps:
-                    continue
-                name = axis.name
-                magnitudes, pos = zip(*axis.log)
-                msteps = axis.microsteps
-                retries = axis.curr_retry
-                offset = axis.get_phase_offset()
-                date = datetime.now().strftime('%Y-%m-%d')
-                manager.write_log([name, status, magnitudes, pos,
-                                   msteps, retries, offset, date])
-        self.log_chelper = manager
-        self.write_log = write_log
 
     def gsend(self, params):
         self.gcode.run_script_from_command(params)
@@ -1075,7 +999,7 @@ class MotorsSync:
                 m.curr_retry += 1
                 if m.curr_retry > m.max_retries:
                     # Write error in log
-                    self.write_log(m)
+                    m.write_log(False)
                     self.handle_state(m, 'done')
                     self.handle_state(m, 'Too many retries')
                 self.handle_state(m, 'retry')
@@ -1187,8 +1111,8 @@ class MotorsSync:
             # Info
             for axis in self.axes:
                 self.handle_state(self.motion[axis], 'done')
+                self.motion[axis].write_log(True)
         self.status.check_retry_result('done')
-        self.write_log()
 
     cmd_SYNC_MOTORS_CALIBRATE_help = 'Calibrate synchronization process model'
     def cmd_SYNC_MOTORS_CALIBRATE(self, gcmd):
@@ -1465,20 +1389,14 @@ class KalmanLiteFilter:
             [self.update(z) for z in samples]).reshape(-1)
 
 
-class StatisticsManager:
-    def __init__(self, gcode, cmd_name, log_name, log_parser, format, max_size=1000):
+class LogFileHelper:
+    def __init__(self, file_name, format, max_size=1000):
         self._load_modules()
-        self.gcode = gcode
-        self.cmd_name = cmd_name.upper()
-        self.log_parser = log_parser
         self.format = format
         self.max_size = max_size
-        # Register commands
-        self.gcode.register_command(self.cmd_name, self.cmd_GET_STATS,
-                                    desc=self.cmd_GET_STATS_help)
         # Variables
         self.home_dir = os.path.dirname(os.path.realpath(__file__))
-        self.log_path = os.path.join(self.home_dir, log_name)
+        self.log_path = os.path.join(self.home_dir, file_name)
         self.error = ''
         # Checks
         self.check_log()
@@ -1492,7 +1410,6 @@ class StatisticsManager:
         if os.path.exists(self.log_path):
             header, raw_log = self.read_log(True)
             if ','.join(header) != self.format:
-                logging.info(f"Log format {','.join(header)} != {self.format}")
                 self.clear_log()
             elif raw_log.shape[0] > self.max_size:
                 self.trim_log(header, raw_log, self.max_size)
@@ -1514,12 +1431,12 @@ class StatisticsManager:
             writer = csv.writer(f)
             writer.writerow(line)
 
-    def trim_log(self, header, raw_log, lines):
-        last_100_rows = raw_log[-lines:]
+    def trim_log(self, header, raw_log, max_size):
+        last_rows = raw_log[-max_size:]
         with open(self.log_path, mode='w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            writer.writerows(last_100_rows)
+            writer.writerows(last_rows)
 
     def clear_log(self):
         os.remove(self.log_path)
@@ -1542,25 +1459,103 @@ class StatisticsManager:
             converted.append(converted_line)
         return np.array(converted, dtype=object)
 
+
+class MotionAxesStats:
+    def __init__(self, config):
+        self.gcode = config.get_printer().lookup_object('gcode')
+        # Register commands
+        self.gcode.register_command('SYNC_MOTORS_STATS', self.cmd_GET_STATS,
+                                    desc=self.cmd_GET_STATS_help)
+        # Variables
+        file_name = 'sync_stats.csv'
+        format = 'axis,status,magnitudes,steps,msteps,retries,offset,date,'
+        self.log_helper = LogFileHelper(file_name, format)
+
+    def get_axes_phase_offsets(self, axes):
+        raw_log = self.log_helper.read_log()
+        if raw_log.size == 0:
+            return {}
+        log = self.log_helper.parse_raw_log(raw_log)
+        a = {}
+        for p in log[::-1]:
+            if all(ax in a for ax in axes):
+                return a
+            if p[0] in a:
+                continue
+            if not p[1]:
+                continue
+            a[p[0]] = p[6]
+        return a
+
+    def write_axis_stats_log(self, axis, state):
+        if self.log_helper.error:
+            return
+        if not axis.actual_msteps:
+            return
+        name = axis.name
+        magnitudes, pos = zip(*axis.motion_log)
+        msteps = axis.microsteps
+        retries = axis.curr_retry
+        offset = axis.get_phase_offset()
+        date = datetime.now().strftime('%Y-%m-%d')
+        self.log_helper.write_log([name, state, magnitudes, pos,
+                                   msteps, retries, offset, date])
+
+    def respond_stats(self, log):
+        a = {}
+        for p in log:
+            a.setdefault(p[0], {
+                'count': 0,
+                'success': 0,
+                'msteps': 0,
+                'magnitudes': [0., 0., 0., 999999.],
+                'retries': 0,
+            })
+            a[p[0]]['count'] += 1
+            if p[1]:
+                a[p[0]]['success'] += 1
+            a[p[0]]['magnitudes'][:2] = (np.add(
+                a[p[0]]['magnitudes'][:2], (p[2][-2], p[2][0])))
+            if p[2].max() > a[p[0]]['magnitudes'][2]:
+                a[p[0]]['magnitudes'][2] = p[2].max()
+            if p[2].min() < a[p[0]]['magnitudes'][3]:
+                a[p[0]]['magnitudes'][3] = p[2].min()
+            a[p[0]]['msteps'] += abs(p[3][-2] / (p[4] / 16))
+            a[p[0]]['retries'] += p[5]
+        for axis, a in a.items():
+            cf_microsteps = 16
+            st_microsteps = a['msteps'] / a['count'] * (cf_microsteps / 16)
+            msg = (f"""
+            --------------------------------
+            {axis.upper()} axis statistics:
+            Successfully synced:     {a['success'] / a['count'] * 100:.2f}%
+            Average start magnitude: {a['magnitudes'][1] / a['count']:.2f}
+            Average end magnitude:   {a['magnitudes'][0] / a['count']:.2f}
+            Average msteps count:    {st_microsteps:.0f}/{cf_microsteps}
+            Average retries count:   {a['retries'] / a['count']:.2f}
+            Min detected magnitude:  {a['magnitudes'][3]:.2f}
+            Max detected magnitude:  {a['magnitudes'][2]:.2f}
+            Synchronization count:   {a['count']}
+            """)
+            self.gcode.respond_info(msg)
+
     cmd_GET_STATS_help = 'Show statistics'
     def cmd_GET_STATS(self, gcmd):
         do_clear = gcmd.get('CLEAR', '').lower()
         if do_clear in ['true', '1']:
-            self.clear_log()
-            self.gcode.respond_info('Logs was cleared')
+            self.log_helper.clear_log()
+            self.gcode.respond_info('Statistics was cleared')
             return
-        if self.error:
-            self.gcode.respond_info(f'Statistics collection is '
-                                    f'disabled due:\n{self.error}')
+        if self.log_helper.error:
+            self.gcode.respond_info(f'Statistics collection is disabled '
+                                    f'due:\n{self.log_helper.error}')
             return
-        raw_log = self.read_log()
+        raw_log = self.log_helper.read_log()
         if raw_log.size == 0:
             self.gcode.respond_info('Logs are empty')
             return
-        log = self.parse_raw_log(raw_log)
-        msg = self.log_parser(log)
-        for line in msg:
-            self.gcode.respond_info(str(line))
+        log = self.log_helper.parse_raw_log(raw_log)
+        self.respond_stats(log)
 
 
 def load_config(config):
