@@ -66,10 +66,11 @@ class StepperManualMove:
     from . import force_move
     calc_move_time = staticmethod(force_move.calc_move_time)
     del force_move
-    def __init__(self, sync, config):
-        self.printer = config.get_printer()
+    def __init__(self, config):
+        self.printer = printer = config.get_printer()
+        self.stepper_en = printer.load_object(config, 'stepper_enable')
         self.motion_queuing = \
-            self.printer.load_object(config, 'motion_queuing', None)
+            printer.load_object(config, 'motion_queuing', None)
         if self.motion_queuing is None:
             self.motion_queuing = DummyPrinterMotionQueuing(config)
         self.trapq = self.motion_queuing.allocate_trapq()
@@ -77,14 +78,21 @@ class StepperManualMove:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.stepper_kin = ffi_main.gc(
             ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
-        sync.add_connect_task(self._handle_connect)
-        self.travel_speed = None
-        self.travel_accel = None
+        printer.register_event_handler("klippy:connect",
+                                       self._handle_connect)
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         self.travel_speed = min(self.toolhead.max_velocity, 100)
         self.travel_accel = min(self.toolhead.max_accel, 5000)
+
+    def stepper_enable(self, stepper_name, mode, ontime, offtime):
+        self.toolhead.dwell(ontime)
+        print_time = self.toolhead.get_last_move_time()
+        el = self.stepper_en.enable_lines[stepper_name]
+        el.motor_enable(print_time) if mode \
+            else el.motor_disable(print_time)
+        self.toolhead.dwell(offtime)
 
     def manual_move(self, mcu_stepper, moves):
         self.toolhead.flush_step_generation()
@@ -116,13 +124,14 @@ class StepperManualMove:
 class BaseSensorHelper:
     def __init__(self, axis, chip_name):
         self.axis = axis
-        self.sync = axis.sync
         self.chip_name = chip_name
         self.dim_type = ''
-        self.printer = self.sync.printer
-        self.chip_config = None
+        self.sync = axis.sync
+        self.printer = axis.printer
+        self.stepper_move = axis.stepper_move
         self.gcode = self.printer.lookup_object('gcode')
         self.reactor = self.printer.get_reactor()
+        self.chip_config = None
         self.is_finished = False
         self.samples = []
         self.request_start_time = None
@@ -192,10 +201,22 @@ class BaseSensorHelper:
                     self.request_end_time, side='right')
         return raw_data[start_idx:end_idx][:, 1:]
 
+    def measure_deviation(self):
+        # Measure the impact
+        self.axis.buzz(25)
+        self.flush_data()
+        self.axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
+        self.axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
+        self.update_start_time()
+        self.axis.toggle_main_stepper(1)
+        self.update_end_time()
+        self.axis.buzz(5)
+        return self.calc_deviation()
+
     def calc_deviation(self):
         raise
 
-    def _detect_move_dir(self):
+    def detect_move_dir(self):
         raise
 
 
@@ -268,11 +289,11 @@ class AccelHelper(BaseSensorHelper):
         self.axis.update_log(int(magnitude))
         return magnitude
 
-    def _detect_move_dir(self):
+    def detect_move_dir(self):
         # Determine axis movement direction
         self.axis.move_dir = [1, 'unknown']
-        self.sync.single_move(self.axis)
-        self.axis.new_magnitude = self.sync.measure(self.axis)
+        self.axis.single_move()
+        self.axis.new_magnitude = self.measure_deviation()
         self.sync.handle_state(self.axis, 'stepped')
         if self.axis.new_magnitude > self.axis.magnitude:
             self.axis.move_dir = [-1, 'Backward']
@@ -357,7 +378,7 @@ class EncoderHelper(BaseSensorHelper):
         self.last_raw_deviation = deviation
         return abs_deviation
 
-    def _detect_move_dir(self):
+    def detect_move_dir(self):
         # Determine axis movement direction
         if self.last_raw_deviation < 0:
             self.axis.move_dir = [-1, 'Backward']
@@ -535,6 +556,7 @@ class MotionAxis:
         self.joint_axes = jx.get(name, [])
         self.phase_offset = ph_off.get(name, None)
         self.config = sync.config
+        self.stepper_move = sync.stepper_move
         self.printer = self.config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
@@ -557,7 +579,7 @@ class MotionAxis:
         self.rd = st_section.getfloat('rotation_distance')
         fspr = st_section.getint('full_steps_per_rotation', 200)
         self.limits = (min_pos + 10, max_pos - 10, (min_pos + max_pos) / 2)
-        self.do_buzz = True
+        self.buzz_moves = {}
         self.rel_buzz_d = self.rd / fspr * 5
         msteps_dict = {m: m for m in self.VALID_MSTEPS}
         self.microsteps = self.config.getchoice(
@@ -649,7 +671,7 @@ class MotionAxis:
         if abs(move_d) < self.move_d * 2:
             return
         self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
-        self.sync.stepper_move.manual_move(self.steppers[1], [move_d])
+        self.stepper_move.manual_move(self.steppers[1], [move_d])
         msteps = int(move_d // self.move_d)
         self.gcode.respond_info(
             f'{self.name.upper()}-Restore previous '
@@ -657,22 +679,61 @@ class MotionAxis:
 
     def toggle_main_stepper(self, mode, times=None):
         if times is None:
-            times = (MOTOR_STALL_TIME,)*2
+            times = (MOTOR_STALL_TIME, MOTOR_STALL_TIME)
         elif len(times) < 2:
             times = (*times, MOTOR_STALL_TIME)
-        self.sync.stepper_enable(self.steppers[0].get_name(), mode, *times)
+        name = self.steppers[0].get_name()
+        self.stepper_move.stepper_enable(name, mode, *times)
 
     def toggle_steppers(self, mode):
         for st in self.steppers:
-            self.sync.stepper_enable(st.get_name(), mode,
-                PIN_MIN_TIME, PIN_MIN_TIME)
+            self.stepper_move.stepper_enable(
+                st.get_name(), mode, PIN_MIN_TIME, PIN_MIN_TIME)
 
     def toggle_joint_axes(self, mode):
         for name in self.joint_axes:
             self.sync.motion[name].toggle_steppers(mode)
 
+    def single_move(self, dir=1):
+        # Move <axis>1 stepper motor by default
+        mcu_stepper = self.steppers[1]
+        move_msteps = self.move_msteps * self.move_dir[0] * dir
+        dist = self.move_d * move_msteps
+        self.actual_msteps += move_msteps
+        self.check_msteps += move_msteps
+        self.stepper_move.manual_move(mcu_stepper, [dist])
+
+    def _gen_buzz_moves(self, rel_moves):
+        moves = []
+        last_abs_pos = 0
+        for osc in reversed(range(0, rel_moves)):
+            abs_pos = self.rel_buzz_d * (osc / rel_moves)
+            for inv in [1, -1]:
+                abs_pos *= inv
+                dist = (abs_pos - last_abs_pos)
+                moves.append(dist)
+                last_abs_pos = abs_pos
+        self.buzz_moves[rel_moves] = moves
+        return moves
+
+    def _get_buzz_moves(self, rel_moves):
+        moves = self.buzz_moves.get(rel_moves)
+        if moves is None:
+            moves = self._gen_buzz_moves(rel_moves)
+        return moves
+
+    def buzz(self, rel_moves=25):
+        # Fading oscillations by <axis>1 stepper
+        mcu_stepper = self.steppers[1]
+        moves = self._get_buzz_moves(rel_moves)
+        self.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
+        self.stepper_move.manual_move(mcu_stepper, moves)
+
+    def measure_deviation(self):
+        return self.chip_helper.measure_deviation()
+
     def detect_move_dir(self):
-        self.chip_helper._detect_move_dir()
+        return self.chip_helper.detect_move_dir()
 
     def update_log(self, deviation):
         self.motion_log.append([int(deviation), self.actual_msteps])
@@ -795,11 +856,10 @@ class MotorsSync:
         self.config = config
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
-        self.stepper_en = self.printer.load_object(config, 'stepper_enable')
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.status = z_tilt.ZAdjustStatus(self.printer)
         self.connect_tasks = []
-        self.stepper_move = StepperManualMove(self, config)
+        self.stepper_move = StepperManualMove(config)
         self.fan_manager = FanManager(config)
         self.stats_helper = MotionAxesStats(config)
         # Read config
@@ -877,54 +937,6 @@ class MotorsSync:
     def gsend(self, params):
         self.gcode.run_script_from_command(params)
 
-    def stepper_enable(self, stepper, mode, ontime, offtime):
-        self.toolhead.dwell(ontime)
-        print_time = self.toolhead.get_last_move_time()
-        el = self.stepper_en.enable_lines[stepper]
-        el.motor_enable(print_time) if mode \
-            else el.motor_disable(print_time)
-        self.toolhead.dwell(offtime)
-
-    def single_move(self, axis, mcu_stepper=None, dir=1):
-        # Move <axis>1 stepper motor by default
-        if mcu_stepper is None:
-            mcu_stepper = axis.get_steppers()[1]
-        move_msteps = axis.move_msteps * axis.move_dir[0] * dir
-        dist = axis.move_d * move_msteps
-        axis.actual_msteps += move_msteps
-        axis.check_msteps += move_msteps
-        self.stepper_move.manual_move(mcu_stepper, [dist])
-
-    def buzz(self, axis, rel_moves=25):
-        # Fading oscillations by <axis>1 stepper
-        moves = []
-        last_abs_pos = 0
-        for osc in reversed(range(0, rel_moves)):
-            abs_pos = axis.rel_buzz_d * (osc / rel_moves)
-            for inv in [1, -1]:
-                abs_pos *= inv
-                dist = (abs_pos - last_abs_pos)
-                moves.append(dist)
-                last_abs_pos = abs_pos
-        axis.toggle_main_stepper(0, (PIN_MIN_TIME,) * 2)
-        self.stepper_move.manual_move(axis.get_steppers()[1], moves)
-
-    def measure(self, axis):
-        # Measure the impact
-        if axis.do_buzz:
-            self.buzz(axis)
-        axis.chip_helper.flush_data()
-        axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
-        axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
-        axis.chip_helper.update_start_time()
-        axis.toggle_main_stepper(1)
-        axis.chip_helper.update_end_time()
-        if axis.do_buzz:
-            self.buzz(axis, 5)
-        else:
-            axis.toggle_main_stepper(0)
-        return axis.chip_helper.calc_deviation()
-
     def homing(self):
         # Homing and going to center
         now = self.reactor.monotonic()
@@ -952,7 +964,7 @@ class MotorsSync:
             axis.flush_motion_data()
             axis.fan.toggle(False)
             axis.chip_helper.start_measurements()
-            axis.init_magnitude = axis.magnitude = self.measure(axis)
+            axis.init_magnitude = axis.magnitude = axis.measure_deviation()
             msg = f"{name}-Initial {dim_type}: {axis.init_magnitude}"
         elif state == 'done':
             axis.fan.toggle(True)
@@ -979,7 +991,7 @@ class MotorsSync:
         # "m" is a main axis, just single axis
         if m.move_dir[1] == 'unknown':
             if not m.actual_msteps or m.curr_retry:
-                m.new_magnitude = self.measure(m)
+                m.new_magnitude = m.measure_deviation()
                 m.magnitude = m.new_magnitude
                 self.handle_state(m, 'static')
             if (not m.actual_msteps
@@ -990,11 +1002,11 @@ class MotorsSync:
             m.detect_move_dir()
         m.move_msteps = min(max(
             int(m.model_solve()), 1), m.max_step_size)
-        self.single_move(m)
-        m.new_magnitude = self.measure(m)
+        m.single_move()
+        m.new_magnitude = m.measure_deviation()
         self.handle_state(m, 'stepped')
         if m.new_magnitude > m.magnitude:
-            self.single_move(m, dir=-1)
+            m.single_move(dir=-1)
             if m.retry_tolerance and m.magnitude > m.retry_tolerance:
                 m.curr_retry += 1
                 if m.curr_retry > m.max_retries:
@@ -1012,7 +1024,7 @@ class MotorsSync:
         # Note: m.axes_steps_diff == s.axes_steps_diff
         steps_diff = abs(abs(m.check_msteps) - abs(s.check_msteps))
         if steps_diff >= m.axes_steps_diff:
-            m.new_magnitude = m.magnitude = self.measure(m)
+            m.new_magnitude = m.magnitude = m.measure_deviation()
             self.handle_state(m, 'static')
             m.check_msteps, s.check_msteps = 0, 0
             return True
@@ -1041,7 +1053,7 @@ class MotorsSync:
         elif self.sync_method == 'sequential' or len(self.axes) == 1:
             for axis in self.axes:
                 m = self.motion[axis]
-                # To skip measure() in _single_sync()
+                # To skip measure_deviation() in _single_sync()
                 m.detect_move_dir()
                 while True:
                     if m.is_finished:
@@ -1295,8 +1307,8 @@ class MotorsSyncCalibrate:
             for inv in invs:
                 m.move_dir[0] = inv
                 for _ in range(peak_mstep):
-                    self.sync.single_move(m)
-                    m.new_magnitude = self.sync.measure(m)
+                    m.single_move()
+                    m.new_magnitude = m.measure_deviation()
                     self.sync.handle_state(m, 'stepped')
                     if m.new_magnitude > max(y_samples):
                         max_steps += 1
