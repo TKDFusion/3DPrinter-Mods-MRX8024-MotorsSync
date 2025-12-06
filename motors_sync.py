@@ -291,14 +291,14 @@ class AccelHelper(BaseSensorHelper):
 
     def detect_move_dir(self):
         # Determine axis movement direction
-        self.axis.move_dir = [1, 'unknown']
+        self.axis.set_move_dir(0)
         self.axis.single_move()
         self.axis.new_magnitude = self.measure_deviation()
         self.sync.msg_helper.stepped_msg(self.axis)
         if self.axis.new_magnitude > self.axis.magnitude:
-            self.axis.move_dir = [-1, 'Backward']
+            self.axis.set_move_dir(-1)
         else:
-            self.axis.move_dir = [1, 'Forward']
+            self.axis.set_move_dir(1)
         self.sync.msg_helper.direction_msg(self.axis)
         self.axis.magnitude = self.axis.new_magnitude
 
@@ -381,9 +381,9 @@ class EncoderHelper(BaseSensorHelper):
     def detect_move_dir(self):
         # Determine axis movement direction
         if self.last_raw_deviation < 0:
-            self.axis.move_dir = [-1, 'Backward']
+            self.axis.set_move_dir(-1)
         else:
-            self.axis.move_dir = [1, 'Forward']
+            self.axis.set_move_dir(1)
         self.sync.msg_helper.direction_msg(self.axis)
         self.axis.new_magnitude = self.axis.magnitude
 
@@ -608,7 +608,8 @@ class MotionAxis:
         self.printer = self.config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
-        self.move_dir = [1, 'unknown']
+        self.move_dir = []
+        self.set_move_dir(0)
         self.move_msteps = 2
         self.actual_msteps = 0
         self.check_msteps = 0
@@ -670,7 +671,7 @@ class MotionAxis:
             self.name_prefixed = f'{name_prefix} {self.name_prefixed}'
 
     def flush_motion_data(self):
-        self.move_dir = [1, 'unknown']
+        self.set_move_dir(0)
         self.move_msteps = 2
         self.actual_msteps = 0
         self.check_msteps = 0
@@ -788,6 +789,17 @@ class MotionAxis:
 
     def write_log(self, state):
         self.sync.stats_helper.write_axis_stats_log(self, state)
+
+    def set_move_dir(self, dir):
+        if dir == 1:
+            self.move_dir = [1, 'Forward']
+        elif dir == -1:
+            self.move_dir = [-1, 'Backward']
+        elif dir == 0:
+            self.move_dir = [1, 'unknown']
+
+    def is_move_dir_unknown(self):
+        return True if self.move_dir[1] == 'unknown' else False
 
     def on_start(self):
         self.flush_motion_data()
@@ -1018,7 +1030,7 @@ class MotorsSync:
 
     def _single_sync(self, m):
         # "m" is a main axis, just single axis
-        if m.move_dir[1] == 'unknown':
+        if m.is_move_dir_unknown():
             if not m.actual_msteps or m.curr_retry:
                 m.new_magnitude = m.measure_deviation()
                 m.magnitude = m.new_magnitude
@@ -1040,7 +1052,7 @@ class MotorsSync:
                 m.curr_retry += 1
                 if m.curr_retry > m.max_retries:
                     raise Exception('Too many retries')
-                m.move_dir[1] = 'unknown'
+                m.set_move_dir(0)
                 self.msg_helper.retry_msg(m)
                 return
             m.is_finished = True
@@ -1338,7 +1350,7 @@ class MotorsSyncCalibrate:
             self.sync.stepper_move.manual_move(
                 mcu_stepper1, [next(looped_pos)])
             for inv in invs:
-                m.move_dir[0] = inv
+                m.set_move_dir(inv)
                 for _ in range(peak_mstep):
                     m.single_move()
                     m.new_magnitude = m.measure_deviation()
