@@ -189,7 +189,7 @@ class BaseSensorHelper:
                 if last_mcu_time > self.request_end_time:
                     return True
                 elif now > lim:
-                    raise self.gcode.error(
+                    raise Exception(
                         'motors_sync: No data from sensor')
 
     def _get_samples(self):
@@ -294,12 +294,12 @@ class AccelHelper(BaseSensorHelper):
         self.axis.move_dir = [1, 'unknown']
         self.axis.single_move()
         self.axis.new_magnitude = self.measure_deviation()
-        self.sync.handle_state(self.axis, 'stepped')
+        self.sync.msg_helper.stepped_msg(self.axis)
         if self.axis.new_magnitude > self.axis.magnitude:
             self.axis.move_dir = [-1, 'Backward']
         else:
             self.axis.move_dir = [1, 'Forward']
-        self.sync.handle_state(self.axis, 'direction')
+        self.sync.msg_helper.direction_msg(self.axis)
         self.axis.magnitude = self.axis.new_magnitude
 
 
@@ -384,7 +384,7 @@ class EncoderHelper(BaseSensorHelper):
             self.axis.move_dir = [-1, 'Backward']
         else:
             self.axis.move_dir = [1, 'Forward']
-        self.sync.handle_state(self.axis, 'direction')
+        self.sync.msg_helper.direction_msg(self.axis)
         self.axis.new_magnitude = self.axis.magnitude
 
 
@@ -395,10 +395,10 @@ class FanController:
         self.is_hold = False
 
     def _hold(self):
-        self.printer.invoke_shutdown("Exception in motors_sync")
+        raise Exception("Internal error in motors_sync")
 
     def _resume(self):
-        self.printer.invoke_shutdown("Exception in motors_sync")
+        raise Exception("Internal error in motors_sync")
 
     def set_state(self, state):
         if not state:
@@ -546,6 +546,54 @@ class FanManager:
         controller = self._fans[fan_name]
         should_be_on = len(off_set) == 0
         controller.set_state(should_be_on)
+
+
+class MotionAxisMsgHelper:
+    def __init__(self, config):
+        self.gcode = config.get_printer().lookup_object('gcode')
+
+    def start_msg(self, ax):
+        msg = (f"{ax.name_prefixed}-Initial "
+               f"{ax.chip_helper.dim_type}: {ax.init_magnitude}")
+        self.gcode.respond_info(msg)
+
+    def done_msg(self, ax):
+        msg = (f"{ax.name_prefixed}-Motors adjusted by "
+               f"{ax.actual_msteps}/{ax.microsteps} step, "
+               f"{ax.chip_helper.dim_type} "
+               f"{ax.init_magnitude} --> {ax.magnitude}")
+        self.gcode.respond_info(msg)
+
+    def in_tolerance_msg(self, axes):
+        retry_tols = ", ".join([
+            f"{ax.name_prefixed}: {ax.retry_tolerance}"
+            for ax in axes])
+        msg = f"Motors magnitudes are in tolerance: {retry_tols}"
+        self.gcode.respond_info(msg)
+
+    def static_msg(self, ax):
+        msg = (f"{ax.name_prefixed}-New {ax.chip_helper.dim_type}: "
+               f"{ax.new_magnitude}")
+        self.gcode.respond_info(msg)
+
+    def stepped_msg(self, ax):
+        msteps = ax.move_msteps * ax.move_dir[0]
+        msg = (f"{ax.name_prefixed}-New {ax.chip_helper.dim_type}: "
+               f"{ax.new_magnitude} on {msteps}/{ax.microsteps} "
+               f"step move")
+        self.gcode.respond_info(msg)
+
+    def direction_msg(self, ax):
+        msg = f"{ax.name_prefixed}-Movement direction: {ax.move_dir[1]}"
+        self.gcode.respond_info(msg)
+
+    def retry_msg(self, ax):
+        msg = (f"{ax.name_prefixed}-Retries: {ax.curr_retry}/"
+               f"{ax.max_retries} Back to last "
+               f"{ax.chip_helper.dim_type}: {ax.magnitude} on "
+               f"{ax.actual_msteps}/{ax.microsteps} step "
+               f"to reach {ax.retry_tolerance}")
+        self.gcode.respond_info(msg)
 
 
 class MotionAxis:
@@ -741,6 +789,24 @@ class MotionAxis:
     def write_log(self, state):
         self.sync.stats_helper.write_axis_stats_log(self, state)
 
+    def on_start(self):
+        self.flush_motion_data()
+        self.fan.toggle(False)
+        self.chip_helper.start_measurements()
+
+    def on_done(self):
+        self.fan.toggle(True)
+        self.chip_helper.finish_measurements()
+        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
+        self.update_phase_offset()
+        self.write_log(True)
+
+    def on_error(self):
+        self.fan.toggle(True)
+        self.chip_helper.finish_measurements()
+        self.toggle_steppers(1)
+        self.write_log(False)
+
     def _init_steppers(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         belt_steppers = [s for s in kin.get_steppers()
@@ -811,9 +877,9 @@ class MotionAxis:
                 fx = self.new_magnitude
             res = model_config['f'](fx, self.model_coeffs)
             if np.isnan(res):
-                self.sync.handle_state(self,
+                raise Exception(
                     f"Microsteps calculation returned NaN "
-                    f"for {self.name.capitalize()} axis")
+                    f"for {self.name_prefixed} axis")
             return res * model_scale
         self.model_solve = model_solve
 
@@ -862,6 +928,7 @@ class MotorsSync:
         self.stepper_move = StepperManualMove(config)
         self.fan_manager = FanManager(config)
         self.stats_helper = MotionAxesStats(config)
+        self.msg_helper = MotionAxisMsgHelper(config)
         # Read config
         self._init_axes()
         self._init_sync_method()
@@ -949,51 +1016,13 @@ class MotorsSync:
         self.toolhead.dwell(MOTOR_STALL_TIME)
         self.toolhead.flush_step_generation()
 
-    def handle_state(self, axis, state=''):
-        name = axis.name_prefixed
-        dim_type = axis.chip_helper.dim_type
-        if state == 'stepped':
-            msteps = axis.move_msteps * axis.move_dir[0]
-            msg = (f"{name}-New {dim_type}: {axis.new_magnitude} "
-                   f"on {msteps}/{axis.microsteps} step move")
-        elif state == 'static':
-            msg = f"{name}-New {dim_type}: {axis.new_magnitude}"
-        elif state == 'direction':
-            msg = f"{name}-Movement direction: {axis.move_dir[1]}"
-        elif state == 'start':
-            axis.flush_motion_data()
-            axis.fan.toggle(False)
-            axis.chip_helper.start_measurements()
-            axis.init_magnitude = axis.magnitude = axis.measure_deviation()
-            msg = f"{name}-Initial {dim_type}: {axis.init_magnitude}"
-        elif state == 'done':
-            axis.fan.toggle(True)
-            axis.chip_helper.finish_measurements()
-            axis.toggle_main_stepper(1, (PIN_MIN_TIME,)*2)
-            axis.update_phase_offset()
-            msg = (f"{name}-Motors adjusted by {axis.actual_msteps}/"
-                   f"{axis.microsteps} step, {dim_type} "
-                   f"{axis.init_magnitude} --> {axis.magnitude}")
-        elif state == 'retry':
-            axis.move_dir[1] = 'unknown'
-            msg = (f"{name}-Retries: {axis.curr_retry}/{axis.max_retries} "
-                   f"Back to last {dim_type}: {axis.magnitude} on "
-                   f"{axis.actual_msteps}/{axis.microsteps} step "
-                   f"to reach {axis.retry_tolerance}")
-        else:
-            for axis in [c for a, c in self.motion.items() if a in self.axes]:
-                axis.fan.toggle(True)
-                axis.chip_helper.finish_measurements()
-            raise self.gcode.error(state)
-        self.gcode.respond_info(msg, True)
-
     def _single_sync(self, m):
         # "m" is a main axis, just single axis
         if m.move_dir[1] == 'unknown':
             if not m.actual_msteps or m.curr_retry:
                 m.new_magnitude = m.measure_deviation()
                 m.magnitude = m.new_magnitude
-                self.handle_state(m, 'static')
+                self.msg_helper.static_msg(m)
             if (not m.actual_msteps
                     and m.retry_tolerance
                     and m.new_magnitude < m.retry_tolerance):
@@ -1004,17 +1033,15 @@ class MotorsSync:
             int(m.model_solve()), 1), m.max_step_size)
         m.single_move()
         m.new_magnitude = m.measure_deviation()
-        self.handle_state(m, 'stepped')
+        self.msg_helper.stepped_msg(m)
         if m.new_magnitude > m.magnitude:
             m.single_move(dir=-1)
             if m.retry_tolerance and m.magnitude > m.retry_tolerance:
                 m.curr_retry += 1
                 if m.curr_retry > m.max_retries:
-                    # Write error in log
-                    m.write_log(False)
-                    self.handle_state(m, 'done')
-                    self.handle_state(m, 'Too many retries')
-                self.handle_state(m, 'retry')
+                    raise Exception('Too many retries')
+                m.move_dir[1] = 'unknown'
+                self.msg_helper.retry_msg(m)
                 return
             m.is_finished = True
             return
@@ -1025,7 +1052,7 @@ class MotorsSync:
         steps_diff = abs(abs(m.check_msteps) - abs(s.check_msteps))
         if steps_diff >= m.axes_steps_diff:
             m.new_magnitude = m.magnitude = m.measure_deviation()
-            self.handle_state(m, 'static')
+            self.msg_helper.static_msg(m)
             m.check_msteps, s.check_msteps = 0, 0
             return True
 
@@ -1062,7 +1089,7 @@ class MotorsSync:
                         break
                     self._single_sync(m)
         else:
-            raise self.gcode.error('Error in sync methods!')
+            raise Exception('Error in sync methods!')
 
     cmd_SYNC_MOTORS_help = 'Start motors synchronization'
     def cmd_SYNC_MOTORS(self, gcmd, force_run=False):
@@ -1101,30 +1128,39 @@ class MotorsSync:
         self.status.reset()
         self.homing()
         self.gcode.respond_info('Motors synchronization started', True)
-        # Try restore last sync position on cold start
-        for axis in self.axes:
-            self.motion[axis].set_phase_offset()
-        # Init axes magnitudes
-        for axis in self.axes:
-            self.handle_state(self.motion[axis], 'start')
-        # Check if all axes in tolerance
-        if not force_run and all(m.init_magnitude < m.retry_tolerance
-             for m in (self.motion[ax] for ax in self.axes)):
-            retry_tols = ''
+        try:
+            # Try restore last sync position on cold start
+            for axis in self.axes:
+                self.motion[axis].set_phase_offset()
+            # Init axes magnitudes
             for axis in self.axes:
                 m = self.motion[axis]
-                m.chip_helper.finish_measurements()
-                m.fan.toggle(True)
-                retry_tols += f'{m.name.upper()}: {m.retry_tolerance}, '
-            self.gcode.respond_info(f"Motors magnitudes are in "
-                                    f"tolerance: {retry_tols}", True)
-        else:
-            self._run_sync()
-            # Info
+                m.on_start()
+                m.init_magnitude = m.magnitude = m.measure_deviation()
+                self.msg_helper.start_msg(m)
+            # Check if all axes in tolerance
+            mot_axes_to_sync = [self.motion[ax] for ax in self.axes]
+            if (not force_run and all(
+                    m.init_magnitude < m.retry_tolerance
+                    for m in mot_axes_to_sync)):
+                for m in mot_axes_to_sync:
+                    m.on_done()
+                self.msg_helper.in_tolerance_msg(mot_axes_to_sync)
+            else:
+                self._run_sync()
+                # Info
+                for axis in self.axes:
+                    m = self.motion[axis]
+                    m.on_done()
+                    self.msg_helper.done_msg(m)
+            self.status.check_retry_result('done')
+        except Exception as e:
             for axis in self.axes:
-                self.handle_state(self.motion[axis], 'done')
-                self.motion[axis].write_log(True)
-        self.status.check_retry_result('done')
+                try:
+                    self.motion[axis].on_error()
+                except:
+                    raise
+            raise self.gcode.error(str(e))
 
     cmd_SYNC_MOTORS_CALIBRATE_help = 'Calibrate synchronization process model'
     def cmd_SYNC_MOTORS_CALIBRATE(self, gcmd):
@@ -1290,13 +1326,10 @@ class MotorsSyncCalibrate:
         y_samples = [-1,]
         mcu_stepper1 = m.get_steppers()[1]
         looped_pos = itertools.cycle([m.rd, -m.rd, -m.rd, m.rd])
-        # Manual handle_state('start')
-        m.flush_motion_data()
+        m.on_start()
         # Scale calibration steps to 1/16
         m.move_msteps = m.microsteps // fullstep
         emul_peak_mstep = peak_mstep * m.move_msteps
-        m.fan.toggle(False)
-        m.chip_helper.start_measurements()
         m.toggle_main_stepper(0)
         for r in range(1, repeats + 1):
             self.gcode.respond_info(
@@ -1309,15 +1342,12 @@ class MotorsSyncCalibrate:
                 for _ in range(peak_mstep):
                     m.single_move()
                     m.new_magnitude = m.measure_deviation()
-                    self.sync.handle_state(m, 'stepped')
+                    self.sync.msg_helper.stepped_msg(m)
                     if m.new_magnitude > max(y_samples):
                         max_steps += 1
                     y_samples.append(m.new_magnitude)
         m.magnitude = m.new_magnitude
-        # Manual handle_state('done')
-        m.fan.toggle(True)
-        m.chip_helper.finish_measurements()
-        m.toggle_main_stepper(1)
+        m.on_done()
         # To array with removed first sample
         y_samples = np.sort(np.array(y_samples[1:]))
         x_samples = np.linspace(0.01, max_steps, len(y_samples))
