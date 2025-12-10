@@ -307,15 +307,23 @@ class BeaconAccelHelper(AccelHelper):
     def __init__(self, axis, chip_name):
         super().__init__(axis, chip_name)
 
-    def _init_chip_config(self):
+    def _init_beacon_config(self):
         beacon = self.printer.lookup_object(self.chip_name)
         # Beacon "chip_config" is "beacon.accel_helper"
         self.chip_config = beacon.accel_helper
+        if self.chip_config is None:
+            msg = "This Beacon has no accelerometer"
+            raise self.printer.config_error(msg)
         # Beacon use self-written "batch_bulk" named as "_api_dump"
         self.chip_config.batch_bulk = self.chip_config._api_dump
         # Beacon module doesn't have "data_rate" attribute
         # Beacon adxl345 sampling rate > ACCEL_FILTER_THRESHOLD
         self._init_chip_filter()
+
+    def _init_chip_config(self):
+        # Move to the end of the klippy:connect queue due beacon
+        # create BeaconAccelHelper in the klippy:connect stage
+        self._run_on_connect(self._init_beacon_config)
 
     def _handle_batch(self, batches):
         hb = super()._handle_batch
