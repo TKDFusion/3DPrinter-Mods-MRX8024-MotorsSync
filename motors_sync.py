@@ -7,7 +7,7 @@ import os, logging, time, itertools
 from datetime import datetime
 import numpy as np
 import chelper
-from . import z_tilt
+from .z_tilt import ZAdjustStatus
 
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
 PIN_MIN_TIME = 0.010            # Minimum wait time to enable hardware pin
@@ -17,20 +17,6 @@ LEVELING_KINEMATICS = (         # Kinematics with interconnected axes
 
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660",
     "tmc5160"]
-
-MATH_MODELS = {
-    "polynomial": lambda fx, coeffs:
-        max(np.roots([*coeffs[:-1], coeffs[-1] - fx]).real),
-    "power": lambda fx, coeffs:
-        (fx / coeffs[0]) ** (1 / coeffs[1]),
-    "root": lambda fx, coeffs:
-        (fx**2 - 2*coeffs[1]*fx + coeffs[1]**2) / coeffs[0]**2,
-    "hyperbolic": lambda fx, coeffs:
-        coeffs[0] / (fx - coeffs[1]),
-    "exponential": lambda fx, coeffs:
-        np.log((fx - coeffs[2]) / coeffs[0]) / coeffs[1],
-    "enc_auto": lambda fx, coeffs: (fx / 1e3 / coeffs[0])
-}
 
 # Plug class for the Klipper version before add "motion_queuing"
 # module, and probably also for Kalico. May the gods forgive me.
@@ -62,6 +48,8 @@ class DummyPrinterMotionQueuing:
         return
 
 
+# MCU_stepper manual enables and manual moves outside normal
+# kinematics, with extra allocated stepper kinematics and trapq.
 class StepperManualMove:
     from . import force_move
     calc_move_time = staticmethod(force_move.calc_move_time)
@@ -121,6 +109,8 @@ class StepperManualMove:
         self.motion_queuing.wipe_trapq(self.trapq)
 
 
+# Base helper class for bulk sensors readings that measure the degree
+# of desynchronization of stepper motors in virtual-axes.
 class BaseSensorHelper:
     def __init__(self, axis, chip_name):
         self.axis = axis
@@ -203,23 +193,26 @@ class BaseSensorHelper:
 
     def measure_deviation(self):
         # Measure the impact
-        self.axis.buzz(25)
+        self.axis.buzz_move(25)
         self.flush_data()
         self.axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
         self.axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
         self.update_start_time()
         self.axis.toggle_main_stepper(1)
         self.update_end_time()
-        self.axis.buzz(5)
-        return self.calc_deviation()
+        self.axis.buzz_move(5)
+        dev = self.calc_deviation()
+        self.axis.update_log(dev)
+        return dev
 
     def calc_deviation(self):
-        raise
+        raise NotImplementedError("Internal error in motors_sync")
 
     def detect_move_dir(self):
-        raise
+        raise NotImplementedError("Internal error in motors_sync")
 
 
+# Accelerometer-based sensor helper calculating acceleration values.
 class AccelHelper(BaseSensorHelper):
     ACCEL_FILTER_THRESHOLD = 3000
     def __init__(self, axis, chip_name):
@@ -286,13 +279,12 @@ class AccelHelper(BaseSensorHelper):
         # Return avg of 5 max magnitudes with deduction static
         magnitude = np.mean(np.sort(magnitudes)[-5:])
         magnitude = np.around(magnitude - static, 2)
-        self.axis.update_log(int(magnitude))
         return magnitude
 
     def detect_move_dir(self):
         # Determine axis movement direction
         self.axis.set_move_dir(0)
-        self.axis.single_move()
+        self.axis.step_move()
         self.axis.new_magnitude = self.measure_deviation()
         self.sync.msg_helper.stepped_msg(self.axis)
         if self.axis.new_magnitude > self.axis.magnitude:
@@ -303,6 +295,7 @@ class AccelHelper(BaseSensorHelper):
         self.axis.magnitude = self.axis.new_magnitude
 
 
+# Beacon accelerometer helper adapter with custom interface.
 class BeaconAccelHelper(AccelHelper):
     def __init__(self, axis, chip_name):
         super().__init__(axis, chip_name)
@@ -326,12 +319,14 @@ class BeaconAccelHelper(AccelHelper):
         self._run_on_connect(self._init_beacon_config)
 
     def _handle_batch(self, batches):
+        # Beacon "_api_dump" send data in an additional array
         hb = super()._handle_batch
         for batch in batches:
             res = hb(batch)
         return res
 
 
+# Encoder-based sensor helper calculating stepper positional values.
 class EncoderHelper(BaseSensorHelper):
     MIN_SAMPLE_PERIOD = 0.000400
     def __init__(self, axis, chip_name):
@@ -382,7 +377,6 @@ class EncoderHelper(BaseSensorHelper):
         dev_norm = self._normalize_encoder_pos(deviation)
         deviation = np.around(dev_norm[1] * 1e3, 2)
         abs_deviation = abs(deviation)
-        self.axis.update_log(int(abs_deviation))
         self.last_raw_deviation = deviation
         return abs_deviation
 
@@ -396,6 +390,9 @@ class EncoderHelper(BaseSensorHelper):
         self.axis.new_magnitude = self.axis.magnitude
 
 
+# Base fan controller class for managing fans during sync process.
+# Temporarily disables and restores fan operation, prevents self
+# vibrations from affecting sensor measurements.
 class FanController:
     def __init__(self, fan, printer):
         self.fan = fan
@@ -492,6 +489,7 @@ class TemperatureFanController(FanController):
         self.max_speed = None
 
 
+# Proxy to toggle fans per virtual-axis. Delegates requests to FanManager.
 class FanProxy:
     def __init__(self, manager, axis_name, fan_names):
         self._manager = manager
@@ -503,6 +501,8 @@ class FanProxy:
             self._manager._request_toggle(name, self._axis_name, state)
 
 
+# Registers and manages all user configured fans. Tracks per-v-axis fans
+# disable requests, ensures fans resume only when all v-axes allow it.
 class FanManager:
     from . import controller_fan, heater_fan, temperature_fan
     FAN_METHODS = {
@@ -556,6 +556,8 @@ class FanManager:
         controller.set_state(should_be_on)
 
 
+# Helper to format MotionAxis state and send to user-facing messages
+# of synchronization, calibration process stage.
 class MotionAxisMsgHelper:
     def __init__(self, config):
         self.gcode = config.get_printer().lookup_object('gcode')
@@ -604,6 +606,8 @@ class MotionAxisMsgHelper:
         self.gcode.respond_info(msg)
 
 
+# Virtual-axis as helper to control and synchronize assigned stepper
+# to another stepper on one belt or to the secondary/overall kinematics.
 class MotionAxis:
     VALID_MSTEPS = [256, 128, 64, 32, 16, 8, 0]
     def __init__(self, sync, name, jx, ph_off):
@@ -613,6 +617,7 @@ class MotionAxis:
         self.phase_offset = ph_off.get(name, None)
         self.config = sync.config
         self.stepper_move = sync.stepper_move
+        self.stats_helper = sync.stats_helper
         self.printer = self.config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
@@ -620,8 +625,7 @@ class MotionAxis:
         self.set_move_dir(0)
         self.move_msteps = 2
         self.actual_msteps = 0
-        self.check_msteps = 0
-        self.backup_msteps = 0
+        self.drift_msteps = 0
         self.init_magnitude = 0.
         self.magnitude = 0.
         self.new_magnitude = 0.
@@ -678,155 +682,6 @@ class MotionAxis:
         if name_prefix := self.config.get(f'axis_prefix_{name}', None):
             self.name_prefixed = f'{name_prefix} {self.name_prefixed}'
 
-    def flush_motion_data(self):
-        self.set_move_dir(0)
-        self.move_msteps = 2
-        self.actual_msteps = 0
-        self.check_msteps = 0
-        self.backup_msteps = 0
-        self.init_magnitude = 0.
-        self.magnitude = 0.
-        self.new_magnitude = 0.
-        self.curr_retry = 0
-        self.is_finished = False
-        self.motion_log = []
-
-    def swap_steppers(self):
-        self.steppers.reverse()
-        self.tmcs.reverse()
-
-    def get_steppers(self):
-        return self.steppers
-
-    def get_phase(self, tmc):
-        field_name = "mscnt"
-        if tmc.fields.lookup_register(field_name, None) is None:
-            # TMC2660 uses MSTEP
-            field_name = "mstep"
-        reg = tmc.fields.lookup_register(field_name)
-        phase = tmc.mcu_tmc.get_register(reg)
-        phase = tmc.fields.get_field(field_name, phase)
-        stepper = self.steppers[self.tmcs.index(tmc)]
-        if not stepper.get_dir_inverted()[0]:
-            return 1023 - phase
-        return phase
-
-    def get_phase_offset(self):
-        p1, p2 = (self.get_phase(t) for t in self.tmcs)
-        return p2 - p1
-
-    def update_phase_offset(self):
-        self.phase_offset = self.get_phase_offset()
-
-    def set_phase_offset(self):
-        # Set phase offset by <axis>1 stepper
-        if self.get_phase_offset() != 0:
-            return
-        if self.phase_offset is None:
-            return
-        move_d = self.phase_offset / 256 * self.move_d * self.microsteps
-        if abs(move_d) < self.move_d * 2:
-            return
-        self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
-        self.stepper_move.manual_move(self.steppers[1], [move_d])
-        msteps = int(move_d // self.move_d)
-        self.gcode.respond_info(
-            f'{self.name.upper()}-Restore previous '
-            f'position: {msteps}/{self.microsteps} step')
-
-    def toggle_main_stepper(self, mode, times=None):
-        if times is None:
-            times = (MOTOR_STALL_TIME, MOTOR_STALL_TIME)
-        elif len(times) < 2:
-            times = (*times, MOTOR_STALL_TIME)
-        name = self.steppers[0].get_name()
-        self.stepper_move.stepper_enable(name, mode, *times)
-
-    def toggle_steppers(self, mode):
-        for st in self.steppers:
-            self.stepper_move.stepper_enable(
-                st.get_name(), mode, PIN_MIN_TIME, PIN_MIN_TIME)
-
-    def toggle_joint_axes(self, mode):
-        for name in self.joint_axes:
-            self.sync.motion[name].toggle_steppers(mode)
-
-    def single_move(self, dir=1):
-        # Move <axis>1 stepper motor by default
-        mcu_stepper = self.steppers[1]
-        move_msteps = self.move_msteps * self.move_dir[0] * dir
-        dist = self.move_d * move_msteps
-        self.actual_msteps += move_msteps
-        self.check_msteps += move_msteps
-        self.stepper_move.manual_move(mcu_stepper, [dist])
-
-    def _gen_buzz_moves(self, rel_moves):
-        moves = []
-        last_abs_pos = 0
-        for osc in reversed(range(0, rel_moves)):
-            abs_pos = self.rel_buzz_d * (osc / rel_moves)
-            for inv in [1, -1]:
-                abs_pos *= inv
-                dist = (abs_pos - last_abs_pos)
-                moves.append(dist)
-                last_abs_pos = abs_pos
-        self.buzz_moves[rel_moves] = moves
-        return moves
-
-    def _get_buzz_moves(self, rel_moves):
-        moves = self.buzz_moves.get(rel_moves)
-        if moves is None:
-            moves = self._gen_buzz_moves(rel_moves)
-        return moves
-
-    def buzz(self, rel_moves=25):
-        # Fading oscillations by <axis>1 stepper
-        mcu_stepper = self.steppers[1]
-        moves = self._get_buzz_moves(rel_moves)
-        self.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
-        self.stepper_move.manual_move(mcu_stepper, moves)
-
-    def measure_deviation(self):
-        return self.chip_helper.measure_deviation()
-
-    def detect_move_dir(self):
-        return self.chip_helper.detect_move_dir()
-
-    def update_log(self, deviation):
-        self.motion_log.append([int(deviation), self.actual_msteps])
-
-    def write_log(self, state):
-        self.sync.stats_helper.write_axis_stats_log(self, state)
-
-    def set_move_dir(self, dir):
-        if dir == 1:
-            self.move_dir = [1, 'Forward']
-        elif dir == -1:
-            self.move_dir = [-1, 'Backward']
-        elif dir == 0:
-            self.move_dir = [1, 'unknown']
-
-    def is_move_dir_unknown(self):
-        return True if self.move_dir[1] == 'unknown' else False
-
-    def on_start(self):
-        self.flush_motion_data()
-        self.fan.toggle(False)
-        self.chip_helper.start_measurements()
-
-    def on_done(self):
-        self.fan.toggle(True)
-        self.chip_helper.finish_measurements()
-        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
-        self.update_phase_offset()
-        self.write_log(True)
-
-    def on_error(self):
-        self.fan.toggle(True)
-        self.chip_helper.finish_measurements()
-        self.toggle_steppers(1)
-        self.write_log(False)
-
     def _init_steppers(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         belt_steppers = [s for s in kin.get_steppers()
@@ -856,52 +711,51 @@ class MotionAxis:
                 raise self.config.error(f"Unable to find TMC driver for "
                                         f"'{stepper.get_name()}' stepper")
 
-    def _init_steps_models(self, def_model):
-        # todo: rewrite all func logic
-        models = {
-            'linear': {'ct': 2, 'a': None, 'f': MATH_MODELS['polynomial']},
-            'quadratic': {'ct': 3, 'a': None, 'f': MATH_MODELS['polynomial']},
-            'power': {'ct': 2, 'a': None, 'f': MATH_MODELS['power']},
-            'root': {'ct': 2, 'a': 0, 'f': MATH_MODELS['root']},
-            'hyperbolic': {'ct': 2, 'a': 0, 'f': MATH_MODELS['hyperbolic']},
-            'exponential': {'ct': 3, 'a': 0, 'f': MATH_MODELS['exponential']},
-            'enc_auto': {'ct': 1, 'a': -1, 'f': MATH_MODELS['enc_auto']},
-        }
+    def _init_steps_model(self, def_model):
+        def poly(fx, cf):
+            return max(np.roots([*cf[:-1], cf[-1] - fx]).real)
+        math_models = {
+            "linear": {"count": 2, "a_forbidden": None,
+                "f": lambda fx, c: poly(fx, c)},
+            "quadratic": {"count": 3, "a_forbidden": None,
+                "f": lambda fx, c: poly(fx, c)},
+            "power": {"count": 2, "a_forbidden": None,
+                "f": lambda fx, c: (fx / c[0]) ** (1 / c[1])},
+            "root": {"count": 2, "a_forbidden": 0,
+                "f": lambda fx, c: (fx**2-2*c[1]*fx+c[1]**2)/c[0]**2},
+            "hyperbolic": {"count": 2, "a_forbidden": 0,
+                "f": lambda fx, c: c[0] / (fx - c[1])},
+            "exponential": {"count": 3, "a_forbidden": 0,
+                "f": lambda fx, c: np.log((fx - c[2]) / c[0]) / c[1]},
+            "enc_auto": {"count": 1, "a_forbidden": 0, "scale": 1,
+                "f": lambda fx, c: fx / 1e3 / c[0]}}
         model = self.config.getlist(f'steps_model_{self.name}', None)
         if model is None:
             model = self.config.getlist('steps_model', def_model)
+        if len(model) < 2:
+            raise self.config.error(f"motors_sync: Invalid steps "
+                                    f"model or its coeffs")
         model_name = model[0]
-        coeffs_vals = list(map(float, model[1:]))
-        coeffs_args = [chr(97 + i) for i in range(len(coeffs_vals) + 1)]
-        model_coeffs = {arg: float(val)
-                        for arg, val in zip(coeffs_args, coeffs_vals)}
-        model_config = models.get(model_name, None)
-        if model_config is None:
-            raise self.config.error(
-                f"motors_sync: Invalid steps model '{model_name}'")
-        if len(model_coeffs) != model_config['ct']:
-            raise self.config.error(
-                f"motors_sync: Steps model '{model_name}' "
-                f"requires {model_config['ct']} coefficients")
-        if model_coeffs['a'] == model_config['a']:
-            raise self.config.error(
-                f"motors_sync: Coefficient 'a' cannot be "
-                f"{model_coeffs['a']} for a '{model_name}' model")
-        self.model_name = model_name
-        self.model_coeffs = tuple(model_coeffs.values())
-        model_scale = self.microsteps / 16
-        if model_name == 'enc_auto':
-            model_scale = 1
-        def model_solve(fx=None):
-            if fx is None:
-                fx = self.new_magnitude
-            res = model_config['f'](fx, self.model_coeffs)
+        model_coeffs = tuple(map(float, model[1:]))
+        model_config = math_models.get(model_name, None)
+        if (model_config is None
+                or len(model_coeffs) != model_config['count']
+                or model_coeffs[0] == model_config['a_forbidden']):
+            raise self.config.error(f"motors_sync: Invalid steps "
+                                    f"model or its coeffs")
+        # Calibration and description of the steps model is performed
+        # with 1/16 step, except encoder "enc_auto" plug model
+        model_scale = model_config.get("scale", self.microsteps / 16)
+        def model_solve(fx):
+            res = model_config['f'](fx, model_coeffs)
             if np.isnan(res):
                 raise Exception(
                     f"Microsteps calculation returned NaN "
                     f"for {self.name_prefixed} axis")
             return res * model_scale
-        self.model_solve = model_solve
+        self.steps_model_solve = model_solve
+        self.model_name = model_name
+        self.model_coeffs = model_coeffs
 
     def init_accel_chip_helper(self, accel_chip_name):
         if isinstance(self.chip_helper, BaseSensorHelper):
@@ -929,21 +783,163 @@ class MotionAxis:
         elif enc_chip_name:
             self.chip_helper = EncoderHelper(self, enc_chip_name)
             def_steps_model = ['enc_auto', self.move_d]
-        else:
-            raise
-        self._init_steps_models(def_steps_model)
+        self._init_steps_model(def_steps_model)
 
     def _init_fan(self, fans):
         self.fan = self.sync.fan_manager.register_fans(self.name, fans)
 
+    def flush_motion_data(self):
+        self.set_move_dir(0)
+        self.move_msteps = 2
+        self.actual_msteps = 0
+        self.drift_msteps = 0
+        self.init_magnitude = 0.
+        self.magnitude = 0.
+        self.new_magnitude = 0.
+        self.curr_retry = 0
+        self.is_finished = False
+        self.motion_log = []
 
+    def swap_steppers(self):
+        self.steppers.reverse()
+        self.tmcs.reverse()
+
+    def get_steppers(self):
+        return self.steppers
+
+    def set_move_dir(self, dir):
+        if dir == 1:
+            self.move_dir = [1, 'Forward']
+        elif dir == -1:
+            self.move_dir = [-1, 'Backward']
+        elif dir == 0:
+            self.move_dir = [1, 'unknown']
+
+    def is_move_dir_unknown(self):
+        return True if self.move_dir[1] == 'unknown' else False
+
+    def update_log(self, deviation):
+        self.motion_log.append([int(deviation), self.actual_msteps])
+
+    def _query_phase(self, mcu_tmc):
+        field_name = "mscnt"
+        if mcu_tmc.fields.lookup_register(field_name, None) is None:
+            # TMC2660 uses MSTEP
+            field_name = "mstep"
+        reg = mcu_tmc.fields.lookup_register(field_name)
+        phase = mcu_tmc.mcu_tmc.get_register(reg)
+        phase = mcu_tmc.fields.get_field(field_name, phase)
+        mcu_stepper = self.steppers[self.tmcs.index(mcu_tmc)]
+        if not mcu_stepper.get_dir_inverted()[0]:
+            return 1023 - phase
+        return phase
+
+    def query_phases_offset(self):
+        p1, p2 = (self._query_phase(t) for t in self.tmcs)
+        return p2 - p1
+
+    def apply_phase_offset(self):
+        # Set phase offset by <axis>1 stepper
+        if self.query_phases_offset() != 0:
+            return
+        if self.phase_offset is None:
+            return
+        move_d = self.phase_offset / 256 * self.move_d * self.microsteps
+        if abs(move_d) < self.move_d * 2:
+            return
+        self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
+        self.stepper_move.manual_move(self.steppers[1], [move_d])
+        msteps = int(move_d // self.move_d)
+        self.gcode.respond_info(
+            f'{self.name_prefixed}-Restore previous '
+            f'position: {msteps}/{self.microsteps} step')
+
+    def toggle_main_stepper(self, mode, times=None):
+        if times is None:
+            times = (MOTOR_STALL_TIME, MOTOR_STALL_TIME)
+        elif len(times) < 2:
+            times = (*times, MOTOR_STALL_TIME)
+        name = self.steppers[0].get_name()
+        self.stepper_move.stepper_enable(name, mode, *times)
+
+    def toggle_steppers(self, mode):
+        for st in self.steppers:
+            self.stepper_move.stepper_enable(
+                st.get_name(), mode, PIN_MIN_TIME, PIN_MIN_TIME)
+
+    def toggle_joint_axes(self, mode):
+        for name in self.joint_axes:
+            self.sync.motion[name].toggle_steppers(mode)
+
+    def calc_move_msteps(self, dev=None):
+        dev = self.new_magnitude if dev is None else dev
+        steps_to_zero = max(int(self.steps_model_solve(dev)), 1)
+        self.move_msteps = min(steps_to_zero, self.max_step_size)
+
+    def step_move(self, dir=1):
+        # Move <axis>1 stepper motor by default
+        mcu_stepper = self.steppers[1]
+        move_msteps = self.move_msteps * self.move_dir[0] * dir
+        dist = self.move_d * move_msteps
+        self.actual_msteps += move_msteps
+        self.drift_msteps += move_msteps
+        self.stepper_move.manual_move(mcu_stepper, [dist])
+
+    def _gen_buzz_moves(self, rel_moves):
+        moves = []
+        last_abs_pos = 0
+        for osc in reversed(range(0, rel_moves)):
+            abs_pos = self.rel_buzz_d * (osc / rel_moves)
+            for inv in [1, -1]:
+                abs_pos *= inv
+                dist = (abs_pos - last_abs_pos)
+                moves.append(dist)
+                last_abs_pos = abs_pos
+        self.buzz_moves[rel_moves] = moves
+        return moves
+
+    def buzz_move(self, rel_moves=25):
+        # Fading oscillations by <axis>1 stepper
+        mcu_stepper = self.steppers[1]
+        moves = self.buzz_moves.get(
+            rel_moves, self._gen_buzz_moves(rel_moves))
+        self.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
+        self.stepper_move.manual_move(mcu_stepper, moves)
+
+    def measure_deviation(self):
+        return self.chip_helper.measure_deviation()
+
+    def detect_move_dir(self):
+        return self.chip_helper.detect_move_dir()
+
+    def on_start(self):
+        self.flush_motion_data()
+        self.fan.toggle(False)
+        self.chip_helper.start_measurements()
+
+    def on_done(self):
+        self.fan.toggle(True)
+        self.chip_helper.finish_measurements()
+        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
+        self.phase_offset = self.query_phases_offset()
+        self.stats_helper.write_axis_stats_log(self, True)
+
+    def on_error(self):
+        self.fan.toggle(True)
+        self.chip_helper.finish_measurements()
+        self.toggle_steppers(1)
+        self.stats_helper.write_axis_stats_log(self, False)
+
+
+# Main entry point for motors synchronization feature. Initializes
+# helpers, registers G-code commands, controls sync state status.
 class MotorsSync:
     def __init__(self, config):
         self.config = config
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
-        self.status = z_tilt.ZAdjustStatus(self.printer)
+        self.status = ZAdjustStatus(self.printer)
         self.connect_tasks = []
         self.stepper_move = StepperManualMove(config)
         self.fan_manager = FanManager(config)
@@ -960,6 +956,7 @@ class MotorsSync:
                                     desc=self.cmd_SYNC_MOTORS_CALIBRATE_help)
         # Variables
         self.reactor = self.printer.get_reactor()
+        self.calibrate_steps_model_helper = None
 
     def add_connect_task(self, task):
         self.connect_tasks.append(task)
@@ -1049,13 +1046,12 @@ class MotorsSync:
                 m.is_finished = True
                 return
             m.detect_move_dir()
-        m.move_msteps = min(max(
-            int(m.model_solve()), 1), m.max_step_size)
-        m.single_move()
+        m.calc_move_msteps()
+        m.step_move()
         m.new_magnitude = m.measure_deviation()
         self.msg_helper.stepped_msg(m)
         if m.new_magnitude > m.magnitude:
-            m.single_move(dir=-1)
+            m.step_move(dir=-1)
             if m.retry_tolerance and m.magnitude > m.retry_tolerance:
                 m.curr_retry += 1
                 if m.curr_retry > m.max_retries:
@@ -1069,11 +1065,11 @@ class MotorsSync:
 
     def check_axis_drift(self, m, s):
         # Note: m.axes_steps_diff == s.axes_steps_diff
-        steps_diff = abs(abs(m.check_msteps) - abs(s.check_msteps))
+        steps_diff = abs(abs(m.drift_msteps) - abs(s.drift_msteps))
         if steps_diff >= m.axes_steps_diff:
             m.new_magnitude = m.magnitude = m.measure_deviation()
             self.msg_helper.static_msg(m)
-            m.check_msteps, s.check_msteps = 0, 0
+            m.drift_msteps, s.drift_msteps = 0, 0
             return True
 
     def _run_sync(self):
@@ -1151,7 +1147,7 @@ class MotorsSync:
         try:
             # Try restore last sync position on cold start
             for axis in self.axes:
-                self.motion[axis].set_phase_offset()
+                self.motion[axis].apply_phase_offset()
             # Init axes magnitudes
             for axis in self.axes:
                 m = self.motion[axis]
@@ -1185,15 +1181,17 @@ class MotorsSync:
     cmd_SYNC_MOTORS_CALIBRATE_help = 'Calibrate synchronization process model'
     def cmd_SYNC_MOTORS_CALIBRATE(self, gcmd):
         # Calibrate sync model and model coeffs
-        if not hasattr(self, 'sync_calibrate_helper'):
-            self.sync_calibrate_helper = MotorsSyncCalibrate(self)
-        self.sync_calibrate_helper.run_calibrate(gcmd)
+        if self.calibrate_steps_model_helper is None:
+            self.calibrate_steps_model_helper = MotorsSyncCalibrate(self)
+        self.calibrate_steps_model_helper.run_calibrate(gcmd)
         self.status.reset()
 
     def get_status(self, eventtime):
         return self.status.get_status(eventtime)
 
 
+# Performs virtual-axis step-to-deviation model calibration, which is
+# used for a faster and more correct steppers synchronization procedure.
 class MotorsSyncCalibrate:
     def __init__(self, sync):
         self.sync = sync
@@ -1360,7 +1358,7 @@ class MotorsSyncCalibrate:
             for inv in invs:
                 m.set_move_dir(inv)
                 for _ in range(peak_mstep):
-                    m.single_move()
+                    m.step_move()
                     m.new_magnitude = m.measure_deviation()
                     self.sync.msg_helper.stepped_msg(m)
                     if m.new_magnitude > max(y_samples):
@@ -1398,7 +1396,7 @@ class MotorsSyncCalibrate:
             except Exception as e:
                 c_conn.send((True, (e,)))
                 c_conn.close()
-        # Run plotter
+        self.gcode.respond_info('Data processing...')
         p_conn, c_conn = multiprocessing.Pipe()
         proc = multiprocessing.Process(target=samples_processing)
         proc.daemon = True
@@ -1406,9 +1404,9 @@ class MotorsSyncCalibrate:
         lim_t = 60.
         now = start_t = last_report_time = self.reactor.monotonic()
         while proc.is_alive():
-            if now > last_report_time + 5.:
+            if now > last_report_time + 10.:
                 last_report_time = now
-                self.gcode.respond_info('Data processing...', True)
+                self.gcode.respond_info('Data processing...')
                 if now > start_t + lim_t:
                     raise self.gcode.error(f'Data processing stuck!')
             now = self.reactor.pause(now + .1)
@@ -1418,9 +1416,11 @@ class MotorsSyncCalibrate:
                                    f'with error: {res[0]}')
         if res[0]:
             self.gcode.respond_info(str(res[0]))
+        # Save best fit function in configfile
         self.save_config(axis, res[1][-1][0])
 
 
+# Lightweight 1D Kalman filter implementation for noise filtering.
 class KalmanLiteFilter:
     def __init__(self, A, H, Q, R, P0, x0):
         self.A = A
@@ -1454,6 +1454,7 @@ class KalmanLiteFilter:
             [self.update(z) for z in samples]).reshape(-1)
 
 
+# Generic csv log file helper with header and size validation.
 class LogFileHelper:
     def __init__(self, file_name, format, max_size=1000):
         self._load_modules()
@@ -1525,6 +1526,8 @@ class LogFileHelper:
         return np.array(converted, dtype=object)
 
 
+# Records sync runs, extract the last successful sync positions, provides
+# general synchronizations statistics to user by G-code command.
 class MotionAxesStats:
     def __init__(self, config):
         self.gcode = config.get_printer().lookup_object('gcode')
@@ -1561,7 +1564,7 @@ class MotionAxesStats:
         magnitudes, pos = zip(*axis.motion_log)
         msteps = axis.microsteps
         retries = axis.curr_retry
-        offset = axis.get_phase_offset()
+        offset = axis.query_phases_offset()
         date = datetime.now().strftime('%Y-%m-%d')
         self.log_helper.write_log([name, state, magnitudes, pos,
                                    msteps, retries, offset, date])
