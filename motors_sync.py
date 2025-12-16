@@ -1366,6 +1366,9 @@ class MotorsSyncCalibrate:
                     if m.new_magnitude > max(y_samples):
                         max_steps += 1
                     y_samples.append(m.new_magnitude)
+        if repeats % 2 == 1:
+            self.sync.stepper_move.manual_move(
+                mcu_stepper1, [next(looped_pos)])
         m.magnitude = m.new_magnitude
         m.on_done()
         # To array with removed first sample
