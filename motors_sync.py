@@ -3,7 +3,7 @@
 # Copyright (C) 2024-2025  Maksim Bolgov <maksim8024@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, time, itertools
+import os, logging, traceback, itertools
 from datetime import datetime
 import numpy as np
 import chelper
@@ -12,11 +12,334 @@ from .z_tilt import ZAdjustStatus
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
 PIN_MIN_TIME = 0.010            # Minimum wait time to enable hardware pin
 MOTOR_STALL_TIME = 0.100        # Minimum wait time to enable motor pin
-LEVELING_KINEMATICS = (         # Kinematics with interconnected axes
-    ['corexy', 'limited_corexy'])
 
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660",
     "tmc5160"]
+
+# Base class for printer kinematics that describes the virtual-axes,
+# synchronization logic, calibration logic for a specific kinematics.
+class BaseKinematics:
+    def __init__(self, config, sync):
+        self.sync = sync
+        self.stats_helper = sync.stats_helper
+        self.msg_helper = sync.msg_helper
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.motion_axes = {}
+        self._init_axes(config)
+        sync.add_connect_task(self._handle_connect)
+        sync.add_connect_task(lambda: self._init_axes_steppers(config))
+
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.toolhead_kin = self.toolhead.get_kinematics()
+
+    def _init_axes(self, config):
+        raise NotImplementedError("Internal error in motors_sync")
+
+    def _init_axes_steppers(self, config):
+        raise NotImplementedError("Internal error in motors_sync")
+
+    def get_motion_axes(self):
+        return self.motion_axes
+
+    def home_rails(self, axes):
+        homed_axes = self.toolhead_kin.get_status(None)['homed_axes']
+        axes_to_home = sorted({ax for axis in axes for ax in
+                               axis.get_physical_axes()})
+        if any(a not in homed_axes for a in axes_to_home):
+            command = f"G28 {' '.join(axes_to_home)}"
+            self.gcode.run_script_from_command(command)
+
+    def apply_axes_phase_offsets(self, axes):
+        # Try restore last sync position on cold start
+        self.toolhead.wait_moves()
+        for axis in axes:
+            axis.apply_phase_offset()
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+
+    def is_axes_in_tolerance(self, axes):
+        return all(a.init_magnitude < a.retry_tolerance for a in axes)
+
+    def axis_sync_step(self, m):
+        # "m" is a main single MotionAxis
+        m.move_on_measure_pos()
+        if m.is_move_dir_unknown():
+            if not m.actual_msteps or m.curr_retry:
+                m.new_magnitude = m.measure_deviation()
+                m.magnitude = m.new_magnitude
+                self.msg_helper.static_msg(m)
+            if (not m.actual_msteps
+                    and m.retry_tolerance
+                    and m.new_magnitude < m.retry_tolerance):
+                m.on_finish()
+                return
+            m.detect_move_dir()
+        m.calc_move_msteps()
+        m.step_move()
+        m.new_magnitude = m.measure_deviation()
+        self.msg_helper.stepped_msg(m)
+        if m.new_magnitude > m.magnitude:
+            m.step_move(dir=-1)
+            if m.retry_tolerance and m.magnitude > m.retry_tolerance:
+                m.curr_retry += 1
+                if m.curr_retry > m.max_retries:
+                    raise Exception('Too many retries')
+                m.set_move_dir(0)
+                self.msg_helper.retry_msg(m)
+                return
+            m.on_finish()
+            return
+        m.magnitude = m.new_magnitude
+
+    def axes_sync(self, axes):
+        raise self.gcode.error("Not implemented for this kinematics")
+
+    def end_sync(self, axes):
+        for axis in axes:
+            axis.on_done()
+            self.msg_helper.done_msg(axis)
+
+    def on_sync_error(self, axes):
+        for axis in axes:
+            axis.on_error()
+            self.msg_helper.done_msg(axis)
+
+    def run_sync(self, axes, force_run=False):
+        self.home_rails(axes)
+        self.apply_axes_phase_offsets(axes)
+        # Init axes magnitudes
+        for ax in axes:
+            ax.on_start()
+            ax.init_magnitude = ax.magnitude = ax.measure_deviation()
+            self.msg_helper.start_msg(ax)
+        # Check if all axes in tolerance
+        if not force_run and self.is_axes_in_tolerance(axes):
+            self.end_sync(axes)
+            self.msg_helper.in_tolerance_msg(axes)
+            return
+        self.axes_sync(axes)
+        self.end_sync(axes)
+
+    def start_sync(self, axes=None, force_run=False):
+        if axes is None:
+            axes = list(self.motion_axes.values())
+        try:
+            self.run_sync(axes, force_run)
+        except Exception as e:
+            try:
+                self.on_sync_error(axes)
+            except:
+                raise Exception("Internal error in motors_sync")
+            logging.error(f"Internal error in motors_sync:\n "
+                          f"{traceback.format_exc()}")
+            raise self.gcode.error(str(e))
+
+    def axis_calibrate_cycle(self, m, peak_mstep, repeats):
+        # "m" is a main single MotionAxis
+        max_steps = 0
+        invs = [1, -1, -1, 1]
+        samples = [-1,]
+        looped_pos = itertools.cycle([m.rd, -m.rd, -m.rd, m.rd])
+        m.on_start()
+        m.move_on_measure_pos()
+        # Scale calibration steps to 1/16
+        m.move_msteps = m.microsteps // 16
+        m.toggle_main_stepper(0)
+        for r in range(1, repeats + 1):
+            self.gcode.respond_info(f'Repeats: {r}/{repeats}')
+            m.manual_move(next(looped_pos))
+            for inv in invs:
+                m.set_move_dir(inv)
+                for _ in range(peak_mstep):
+                    m.step_move()
+                    m.new_magnitude = m.measure_deviation()
+                    self.msg_helper.stepped_msg(m)
+                    if m.new_magnitude > max(samples):
+                        max_steps += 1
+                    samples.append(m.new_magnitude)
+        if repeats % 2 == 1:
+            m.manual_move(next(looped_pos))
+        m.magnitude = m.new_magnitude
+        m.on_done()
+        return max_steps, samples[1:]
+
+    def calibrate_axis_steps_model(self, axis, peak_mstep, repeats):
+        raise self.gcode.error("Not implemented for this kinematics")
+
+    def get_linked_calibration_axes(self, axis):
+        raise self.gcode.error("Not implemented for this kinematics")
+
+
+# Axially uncoupled cartesian kinematics implementation
+class CartesianKinematics(BaseKinematics):
+    def __init__(self, config, sync):
+        super().__init__(config, sync)
+
+    @staticmethod
+    def get_axes_rails_center(config, axes):
+        positions = {}
+        for axis in axes:
+            st_section = config.getsection('stepper_' + axis)
+            min_pos = st_section.getfloat('position_min', 0)
+            max_pos = st_section.getfloat('position_max')
+            positions.update({axis: (min_pos + max_pos) / 2})
+        return [positions.get(a, None) for a in ['x', 'y', 'z']]
+
+    def _init_axes(self, config):
+        valid_axes = ['x', 'y']
+        axes = sorted([a.lower() for a in config.getlist('axes')])
+        if any(a not in valid_axes for a in axes):
+            raise config.error(f"motors_sync: Invalid axes '{axes}'")
+        sync_pos = self.get_axes_rails_center(config, axes)
+        ph_offs = self.stats_helper.get_axes_phase_offsets(axes)
+        self.motion_axes.update(
+            {ax: MotionAxis(self.sync, ax, axes, ph_offs.get(ax),
+                'stepper_' + ax, sync_pos, False) for ax in axes})
+
+    def _init_axes_steppers(self, config):
+        for axis in self.motion_axes.values():
+            belt_steppers = [s for s in self.toolhead_kin.get_steppers()
+                             if 'stepper_' + axis.name in s.get_name()]
+            if len(belt_steppers) not in (2,):
+                raise config.error(
+                    f"motors_sync: Not supported "
+                    f"'{len(belt_steppers)}' count of motors")
+            for stepper in belt_steppers:
+                st_section = config.getsection(stepper.get_name())
+                st_msteps = st_section.getint('microsteps')
+                if axis.microsteps > st_msteps:
+                    raise config.error(
+                        f'motors_sync: Invalid config microsteps '
+                        f'count, cannot be more than in stepper '
+                        f'config, {axis.microsteps} > {st_msteps}')
+            axis.add_steppers(*belt_steppers, belt_steppers[1], None)
+
+    def axes_sync(self, axes):
+        # To skip extra measure_deviation() in axis_sync_step()
+        axes[0].detect_move_dir()
+        for m in axes:
+            while True:
+                if m.is_finished:
+                    if all(m.is_finished for m in axes):
+                        return
+                    break
+                self.axis_sync_step(m)
+
+    def calibrate_axis_steps_model(self, axis, peak_mstep, repeats):
+        return self.axis_calibrate_cycle(axis, peak_mstep, repeats)
+
+    def get_linked_calibration_axes(self, axis):
+        return sorted({axis.name for axis in self.motion_axes.values()})
+
+
+# AWD corexy kinematics implementation
+class CoreXYKinematics(BaseKinematics):
+    def __init__(self, config, sync):
+        super().__init__(config, sync)
+
+    @staticmethod
+    def check_common_attr(config, axes, common_attr):
+        # Apply restrictions for interconnected axes kinematics
+        for attr in common_attr:
+            diff = {getattr(cls, attr) for cls in axes}
+            if len(diff) != 1:
+                params_str = ', '.join(f"'{attr}: {v}'" for v in diff)
+                raise config.error(
+                    f"motors_sync: Options {params_str} cannot "
+                    f"be different for this kinematics")
+
+    def _init_axes(self, config):
+        valid_axes = ['x', 'y']
+        axes = sorted([a.lower() for a in config.getlist(
+            'axes', count=len(valid_axes), default=valid_axes)])
+        if any(a not in valid_axes for a in axes):
+            raise config.error(f"motors_sync: Invalid axes '{axes}'")
+        sync_pos = CartesianKinematics.get_axes_rails_center(config, axes)
+        ph_offs = self.stats_helper.get_axes_phase_offsets(axes)
+        self.motion_axes.update(
+            {ax: MotionAxis(self.sync, ax, axes, ph_offs.get(ax),
+                'stepper_' + ax, sync_pos, False) for ax in axes})
+        attr = ['microsteps', 'model_name', 'model_coeffs',
+                'max_step_size', 'axes_steps_diff']
+        self.check_common_attr(config, self.motion_axes.values(), attr)
+
+    def _init_axes_steppers(self, config):
+        axes_alloc_steppers = []
+        for axis in self.motion_axes.values():
+            belt_steppers = [s for s in self.toolhead_kin.get_steppers()
+                             if 'stepper_' + axis.name in s.get_name()]
+            if len(belt_steppers) not in (2,):
+                raise config.error(
+                    f"motors_sync: Not supported "
+                    f"'{len(belt_steppers)}' count of motors")
+            for stepper in belt_steppers:
+                st_section = config.getsection(stepper.get_name())
+                st_msteps = st_section.getint('microsteps')
+                if axis.microsteps > st_msteps:
+                    raise config.error(
+                        f'motors_sync: Invalid config microsteps '
+                        f'count, cannot be more than in stepper '
+                        f'config, {axis.microsteps} > {st_msteps}')
+            axes_alloc_steppers.append([axis, belt_steppers])
+        # Add 1 motor from the opposite axis to conflict motors on each
+        # axis. Two enabled motors on the same axis (belt) can twist
+        # the beam due to belt tension desync, distorting measurements.
+        dx, dy = axes_alloc_steppers
+        dx[0].add_steppers(dx[1][0], dx[1][1], dx[1][1], [dy[1][0]])
+        dy[0].add_steppers(dy[1][0], dy[1][1], dy[1][1], [dx[1][0]])
+
+    def check_axis_drift(self, m, s):
+        steps_diff = abs(abs(m.drift_msteps) - abs(s.drift_msteps))
+        if steps_diff >= m.axes_steps_diff:
+            m.new_magnitude = m.magnitude = m.measure_deviation()
+            self.msg_helper.static_msg(m)
+            m.reset_drift_msteps()
+            s.reset_drift_msteps()
+            return True
+
+    def axes_sync(self, axes):
+        cycling = itertools.cycle(axes)
+        max_ax = [c for c in sorted(
+            axes, key=lambda i: i.init_magnitude)][-1]
+        # To skip extra measure_deviation() in axis_sync_step()
+        max_ax.detect_move_dir()
+        # "m" is a main, "s" is a second MotionAxis
+        while True:
+            m = next(cycling)
+            cycling, _cycle = itertools.tee(cycling)
+            s = next(_cycle)
+            if m.is_finished:
+                if all(m.is_finished for m in axes):
+                    break
+                continue
+            if m.magnitude < s.magnitude and not s.is_finished:
+                self.check_axis_drift(m, s)
+                continue
+            self.axis_sync_step(m)
+
+    def calibrate_axis_steps_model(self, axis, peak_mstep, repeats):
+        return self.axis_calibrate_cycle(axis, peak_mstep, repeats)
+
+    def get_linked_calibration_axes(self, axis):
+        return sorted({axis.name for axis in self.motion_axes.values()})
+
+
+# Parse kinematics from configfile and choosing from supported ones.
+class KinematicsParser:
+    @staticmethod
+    def get_kinematics(config, sync):
+        kin_map = {cls.__name__.replace('Kinematics', '').lower(): cls
+                   for cls in BaseKinematics.__subclasses__()}
+        kin_map.update({'limitedcorexy': CoreXYKinematics})
+        printer_section = config.getsection('printer')
+        conf_kin = printer_section.get('kinematics')
+        kin_helper = kin_map.get("".join(conf_kin.split("_")))
+        if kin_helper is None:
+            raise config.error(f"motors_sync: Not supported "
+                               f"'{conf_kin}' kinematics")
+        return kin_helper(config, sync)
+
 
 # Plug class for the Klipper version before add "motion_queuing"
 # module, and probably also for Kalico. May the gods forgive me.
@@ -74,13 +397,19 @@ class StepperManualMove:
         self.travel_speed = min(self.toolhead.max_velocity, 100)
         self.travel_accel = min(self.toolhead.max_accel, 5000)
 
-    def stepper_enable(self, stepper_name, mode, ontime, offtime):
-        self.toolhead.dwell(ontime)
-        print_time = self.toolhead.get_last_move_time()
-        el = self.stepper_en.enable_lines[stepper_name]
-        el.motor_enable(print_time) if mode \
-            else el.motor_disable(print_time)
-        self.toolhead.dwell(offtime)
+    def steppers_enable(self, mcu_steppers, mode):
+        ptime = self.toolhead.get_last_move_time()
+        did_change = False
+        for mcu_stepper in mcu_steppers:
+            el = self.stepper_en.lookup_enable(mcu_stepper.get_name())
+            if el.is_motor_enabled() == mode:
+                continue
+            if mode:
+                el.motor_enable(ptime)
+            else:
+                el.motor_disable(ptime)
+            did_change = True
+        return did_change
 
     def manual_move(self, mcu_stepper, moves):
         self.toolhead.flush_step_generation()
@@ -117,6 +446,7 @@ class BaseSensorHelper:
         self.chip_name = chip_name
         self.dim_type = ''
         self.sync = axis.sync
+        self.msg_helper = self.sync.msg_helper
         self.printer = axis.printer
         self.stepper_move = axis.stepper_move
         self.gcode = self.printer.lookup_object('gcode')
@@ -141,6 +471,9 @@ class BaseSensorHelper:
             task()
         else:
             self.printer.register_event_handler("klippy:connect", task)
+
+    def get_name(self):
+        return self.chip_name
 
     def flush_data(self):
         self.is_finished = False
@@ -286,12 +619,12 @@ class AccelHelper(BaseSensorHelper):
         self.axis.set_move_dir(0)
         self.axis.step_move()
         self.axis.new_magnitude = self.measure_deviation()
-        self.sync.msg_helper.stepped_msg(self.axis)
+        self.msg_helper.stepped_msg(self.axis)
         if self.axis.new_magnitude > self.axis.magnitude:
             self.axis.set_move_dir(-1)
         else:
             self.axis.set_move_dir(1)
-        self.sync.msg_helper.direction_msg(self.axis)
+        self.msg_helper.direction_msg(self.axis)
         self.axis.magnitude = self.axis.new_magnitude
 
 
@@ -349,14 +682,19 @@ class EncoderHelper(BaseSensorHelper):
     def _check_encoder_place(self):
         # Swap duties between motors depending on encoder place
         binded_stepper = self.chip_config.calibration.stepper_name
-        axis_steppers = [s.get_name() for s in self.axis.get_steppers()]
+        sts = self.axis.get_steppers()
+        axis_steppers = [s.get_name() for s in sts['self_steppers']]
         if binded_stepper not in axis_steppers:
             raise self.printer.config_error(
-                f"motors_sync: Encoder '{self.chip_name}' stepper: "
+                f"motors_sync: Encoder '{self.chip_name}' stepper "
                 f"'{binded_stepper}' not in '{self.axis.name}' "
                 f"axis steppers: '{', '.join(axis_steppers)}'")
-        if binded_stepper != axis_steppers[0]:
-            self.axis.swap_steppers()
+        if binded_stepper != sts['enable_stepper'].get_name():
+            if self.axis.swap_steppers(binded_stepper) is False:
+                raise self.printer.config_error(
+                    f"motors_sync: Encoder '{self.chip_name}' must "
+                    f"be on another stepper in axis steppers: "
+                    f"'{', '.join(axis_steppers)}")
 
     def _normalize_encoder_pos(self, pos):
         angle = (1 << 16) / pos
@@ -386,7 +724,7 @@ class EncoderHelper(BaseSensorHelper):
             self.axis.set_move_dir(-1)
         else:
             self.axis.set_move_dir(1)
-        self.sync.msg_helper.direction_msg(self.axis)
+        self.msg_helper.direction_msg(self.axis)
         self.axis.new_magnitude = self.axis.magnitude
 
 
@@ -610,17 +948,20 @@ class MotionAxisMsgHelper:
 # to another stepper on one belt or to the secondary/overall kinematics.
 class MotionAxis:
     VALID_MSTEPS = [256, 128, 64, 32, 16, 8, 0]
-    def __init__(self, sync, name, jx, ph_off):
+    def __init__(self, sync, name, ph_axes, ph_off,
+                 main_stepper, sync_pos, is_multi_axis):
         self.sync = sync
         self.name = name
-        self.joint_axes = jx.get(name, [])
-        self.phase_offset = ph_off.get(name, None)
+        self.physical_axes = ph_axes
+        self.phase_offset = ph_off
+        self.start_sync_pos = sync_pos
+        self.is_multi_axis = is_multi_axis
         self.config = sync.config
         self.stepper_move = sync.stepper_move
         self.stats_helper = sync.stats_helper
         self.printer = self.config.get_printer()
-        self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
+        sync.add_connect_task(self._handle_connect)
         self.move_dir = []
         self.set_move_dir(0)
         self.move_msteps = 2
@@ -633,13 +974,10 @@ class MotionAxis:
         self.is_finished = False
         self.chip_helper = None
         self.motion_log = []
-        stepper = 'stepper_' + name
-        st_section = self.config.getsection(stepper)
-        min_pos = st_section.getfloat('position_min', 0)
-        max_pos = st_section.getfloat('position_max')
+        self.steppers = None
+        st_section = self.config.getsection(main_stepper)
         self.rd = st_section.getfloat('rotation_distance')
         fspr = st_section.getint('full_steps_per_rotation', 200)
-        self.limits = (min_pos + 10, max_pos - 10, (min_pos + max_pos) / 2)
         self.buzz_moves = {}
         self.rel_buzz_d = self.rd / fspr * 5
         msteps_dict = {m: m for m in self.VALID_MSTEPS}
@@ -649,8 +987,6 @@ class MotionAxis:
             self.microsteps = self.config.getchoice(
                 'microsteps', msteps_dict, default=16)
         self.move_d = self.rd / fspr / self.microsteps
-        sync.add_connect_task(self._init_steppers)
-        sync.add_connect_task(self._init_tmc_drivers)
         self._init_chip_helper()
         conf_fans = self.config.getlist(f'head_fan_{name}', '')
         if not conf_fans:
@@ -682,34 +1018,9 @@ class MotionAxis:
         if name_prefix := self.config.get(f'axis_prefix_{name}', None):
             self.name_prefixed = f'{name_prefix} {self.name_prefixed}'
 
-    def _init_steppers(self):
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        belt_steppers = [s for s in kin.get_steppers()
-                         if 'stepper_' + self.name in s.get_name()]
-        if len(belt_steppers) not in (2,):
-            raise self.config.error(f"motors_sync: Not supported "
-                                    f"'{len(belt_steppers)}' count of motors")
-        for steppers in belt_steppers:
-            st_section = self.config.getsection(steppers.get_name())
-            st_msteps = st_section.getint('microsteps')
-            if self.microsteps > st_msteps:
-                raise self.config.error(
-                    f'motors_sync: Invalid microsteps count, cannot be '
-                    f'more than steppers, {self.microsteps} vs {st_msteps}')
-        self.steppers = belt_steppers
-
-    def _init_tmc_drivers(self):
-        self.tmcs = []
-        for stepper in self.steppers:
-            for driver in TRINAMIC_DRIVERS:
-                driver_name = f"{driver} {stepper.get_name()}"
-                module = self.printer.lookup_object(driver_name, None)
-                if module is not None:
-                    self.tmcs.append(module)
-                    break
-            else:
-                raise self.config.error(f"Unable to find TMC driver for "
-                                        f"'{stepper.get_name()}' stepper")
+    def _handle_connect(self):
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.travel_speed = self.toolhead.max_velocity / 2
 
     def _init_steps_model(self, def_model):
         def poly(fx, cf):
@@ -788,6 +1099,57 @@ class MotionAxis:
     def _init_fan(self, fans):
         self.fan = self.sync.fan_manager.register_fans(self.name, fans)
 
+    def _get_tmc_drivers(self, mcu_steppers):
+        for mcu_stepper in mcu_steppers:
+            for driver in TRINAMIC_DRIVERS:
+                driver_name = f"{driver} {mcu_stepper.get_name()}"
+                module = self.printer.lookup_object(driver_name, None)
+                if module is not None:
+                    yield module
+                    break
+            else:
+                raise self.printer.config_error(
+                    f"motors_sync: Unable to find TMC driver "
+                    f"for '{mcu_stepper.get_name()}' stepper")
+
+    def add_steppers(self, enable, step, buzz, conflict):
+        steppers_set = {enable, step, buzz}
+        if len(steppers_set) == 1:
+            raise Exception("Cannot put all tasks on one stepper")
+        self_steppers = list(steppers_set)
+        self_tmcs = list(self._get_tmc_drivers(self_steppers))
+        self.steppers = {
+            'self_steppers': self_steppers,
+            'self_tmcs': self_tmcs,
+            'enable_stepper': enable,
+            'step_stepper': step,
+            'buzz_stepper': buzz,
+            'conflict_steppers': conflict,
+        }
+
+    def swap_steppers(self, en_stepper_name):
+        if self.is_multi_axis:
+            return False
+        sts = self.steppers
+        new_en_stepper = next(
+            (st for st in sts['self_steppers']
+             if st.get_name() == en_stepper_name), None)
+        if new_en_stepper is None:
+            return False
+        old_en_stepper = sts['enable_stepper']
+        if new_en_stepper == old_en_stepper:
+            raise Exception("Swap same stepper")
+        sts['enable_stepper'] = new_en_stepper
+        for key in ('step_stepper', 'buzz_stepper'):
+            curr = sts[key]
+            if curr is new_en_stepper:
+                sts[key] = old_en_stepper
+            elif curr is old_en_stepper:
+                sts[key] = new_en_stepper
+        sts['self_steppers'].reverse()
+        sts['self_tmcs'].reverse()
+        return True
+
     def flush_motion_data(self):
         self.set_move_dir(0)
         self.move_msteps = 2
@@ -800,12 +1162,20 @@ class MotionAxis:
         self.is_finished = False
         self.motion_log = []
 
-    def swap_steppers(self):
-        self.steppers.reverse()
-        self.tmcs.reverse()
+    def get_physical_axes(self):
+        return self.physical_axes
 
     def get_steppers(self):
         return self.steppers
+
+    def set_retry_tolerance(self, retry_tol):
+        self.retry_tolerance = retry_tol
+
+    def set_max_retries(self, max_retries):
+        self.max_retries = max_retries
+
+    def reset_drift_msteps(self):
+        self.drift_msteps = 0
 
     def set_move_dir(self, dir):
         if dir == 1:
@@ -821,7 +1191,7 @@ class MotionAxis:
     def update_log(self, deviation):
         self.motion_log.append([int(deviation), self.actual_msteps])
 
-    def _query_phase(self, mcu_tmc):
+    def _query_phase(self, mcu_stepper, mcu_tmc):
         field_name = "mscnt"
         if mcu_tmc.fields.lookup_register(field_name, None) is None:
             # TMC2660 uses MSTEP
@@ -829,47 +1199,74 @@ class MotionAxis:
         reg = mcu_tmc.fields.lookup_register(field_name)
         phase = mcu_tmc.mcu_tmc.get_register(reg)
         phase = mcu_tmc.fields.get_field(field_name, phase)
-        mcu_stepper = self.steppers[self.tmcs.index(mcu_tmc)]
         if not mcu_stepper.get_dir_inverted()[0]:
             return 1023 - phase
         return phase
 
     def query_phases_offset(self):
-        p1, p2 = (self._query_phase(t) for t in self.tmcs)
+        if self.is_multi_axis:
+            return None
+        items = zip(self.steppers['self_steppers'],
+                    self.steppers['self_tmcs'])
+        p1, p2 = (self._query_phase(s, t) for s, t in items)
         return p2 - p1
 
     def apply_phase_offset(self):
-        # Set phase offset by <axis>1 stepper
-        if self.query_phases_offset() != 0:
-            return
         if self.phase_offset is None:
+            return
+        if self.query_phases_offset() != 0:
             return
         move_d = self.phase_offset / 256 * self.move_d * self.microsteps
         if abs(move_d) < self.move_d * 2:
             return
         self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
-        self.stepper_move.manual_move(self.steppers[1], [move_d])
+        mcu_stepper = self.steppers['step_stepper']
+        self.stepper_move.manual_move(mcu_stepper, [move_d])
         msteps = int(move_d // self.move_d)
         self.gcode.respond_info(
             f'{self.name_prefixed}-Restore previous '
             f'position: {msteps}/{self.microsteps} step')
+        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
 
     def toggle_main_stepper(self, mode, times=None):
         if times is None:
             times = (MOTOR_STALL_TIME, MOTOR_STALL_TIME)
         elif len(times) < 2:
-            times = (*times, MOTOR_STALL_TIME)
-        name = self.steppers[0].get_name()
-        self.stepper_move.stepper_enable(name, mode, *times)
+            times = (times[0], MOTOR_STALL_TIME)
+        mcu_stepper = self.steppers['enable_stepper']
+        self.toolhead.dwell(times[0])
+        self.stepper_move.steppers_enable([mcu_stepper], mode)
+        self.toolhead.dwell(times[1])
 
-    def toggle_steppers(self, mode):
-        for st in self.steppers:
-            self.stepper_move.stepper_enable(
-                st.get_name(), mode, PIN_MIN_TIME, PIN_MIN_TIME)
+    def toggle_self_steppers(self, mode):
+        mcu_steppers = self.steppers['self_steppers']
+        ret = self.stepper_move.steppers_enable(mcu_steppers, mode)
+        if ret:
+            self.toolhead.dwell(MOTOR_STALL_TIME)
 
-    def toggle_joint_axes(self, mode):
-        for name in self.joint_axes:
-            self.sync.motion[name].toggle_steppers(mode)
+    def toggle_conflict_steppers(self, mode):
+        mcu_steppers = self.steppers['conflict_steppers']
+        if mcu_steppers is None:
+            return
+        ret = self.stepper_move.steppers_enable(mcu_steppers, mode)
+        if ret:
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+
+    def move_on_measure_pos(self):
+        curr_pos = self.toolhead.get_position()
+        sync_pos = self.start_sync_pos
+        poss = zip(curr_pos, sync_pos)
+        if all((n is None) or (c == n) for c, n in poss):
+            return
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        self.toolhead.manual_move(sync_pos, self.travel_speed)
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        self.toolhead.flush_step_generation()
+
+    def manual_move(self, dist):
+        self.toggle_conflict_steppers(0)
+        mcu_stepper = self.steppers['buzz_stepper']
+        self.stepper_move.manual_move(mcu_stepper, [dist])
 
     def calc_move_msteps(self, dev=None):
         dev = self.new_magnitude if dev is None else dev
@@ -877,8 +1274,7 @@ class MotionAxis:
         self.move_msteps = min(steps_to_zero, self.max_step_size)
 
     def step_move(self, dir=1):
-        # Move <axis>1 stepper motor by default
-        mcu_stepper = self.steppers[1]
+        mcu_stepper = self.steppers['step_stepper']
         move_msteps = self.move_msteps * self.move_dir[0] * dir
         dist = self.move_d * move_msteps
         self.actual_msteps += move_msteps
@@ -899,17 +1295,21 @@ class MotionAxis:
         return moves
 
     def buzz_move(self, rel_moves=25):
-        # Fading oscillations by <axis>1 stepper
-        mcu_stepper = self.steppers[1]
+        # Fading oscillations by <buzz_stepper> stepper
+        mcu_stepper = self.steppers['buzz_stepper']
         moves = self.buzz_moves.get(
             rel_moves, self._gen_buzz_moves(rel_moves))
         self.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
         self.stepper_move.manual_move(mcu_stepper, moves)
 
     def measure_deviation(self):
+        self.move_on_measure_pos()
+        self.toggle_conflict_steppers(0)
         return self.chip_helper.measure_deviation()
 
     def detect_move_dir(self):
+        self.move_on_measure_pos()
+        self.toggle_conflict_steppers(0)
         return self.chip_helper.detect_move_dir()
 
     def on_start(self):
@@ -917,17 +1317,24 @@ class MotionAxis:
         self.fan.toggle(False)
         self.chip_helper.start_measurements()
 
-    def on_done(self):
+    def on_finish(self):
+        self.is_finished = True
         self.fan.toggle(True)
         self.chip_helper.finish_measurements()
-        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
+
+    def on_done(self):
+        if not self.is_finished:
+            self.on_finish()
+        self.toggle_self_steppers(1)
+        self.toggle_conflict_steppers(1)
         self.phase_offset = self.query_phases_offset()
         self.stats_helper.write_axis_stats_log(self, True)
 
     def on_error(self):
         self.fan.toggle(True)
         self.chip_helper.finish_measurements()
-        self.toggle_steppers(1)
+        self.toggle_self_steppers(1)
+        self.toggle_conflict_steppers(1)
         self.stats_helper.write_axis_stats_log(self, False)
 
 
@@ -946,8 +1353,7 @@ class MotorsSync:
         self.stats_helper = MotionAxesStats(config)
         self.msg_helper = MotionAxisMsgHelper(config)
         # Read config
-        self._init_axes()
-        self._init_sync_method()
+        self.kin_helper = KinematicsParser.get_kinematics(config, self)
         # Register commands
         self.gcode.register_command('SYNC_MOTORS', self.cmd_SYNC_MOTORS,
                                     desc=self.cmd_SYNC_MOTORS_help)
@@ -955,228 +1361,61 @@ class MotorsSync:
                                     self.cmd_SYNC_MOTORS_CALIBRATE,
                                     desc=self.cmd_SYNC_MOTORS_CALIBRATE_help)
         # Variables
-        self.reactor = self.printer.get_reactor()
         self.calibrate_steps_model_helper = None
 
     def add_connect_task(self, task):
         self.connect_tasks.append(task)
 
     def _handle_connect(self):
-        self.toolhead = self.printer.lookup_object('toolhead')
-        self.travel_speed = self.toolhead.max_velocity / 2
-        self.travel_accel = min(self.toolhead.max_accel, 5000)
-        self.kin = self.toolhead.get_kinematics()
         for task in self.connect_tasks: task()
         self.connect_tasks.clear()
 
-    def _check_common_attr(self):
-        # Apply restrictions for LEVELING_KINEMATICS kinematics
-        common_attr = ['microsteps', 'model_name', 'model_coeffs',
-                       'max_step_size', 'axes_steps_diff']
-        for attr in common_attr:
-            diff = set([getattr(cls, attr) for cls in self.motion.values()])
-            if len(diff) < 2:
-                continue
-            params_str = ', '.join(f"'{attr}: {v}'" for v in diff)
-            raise self.config.error(
-                f"motors_sync: Options {params_str} cannot be "
-                f"different for a '{self.conf_kin}' kinematics")
-
-    def _init_axes(self):
-        valid_axes = ['x', 'y']
-        printer_section = self.config.getsection('printer')
-        self.conf_kin = printer_section.get('kinematics')
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self.do_level = True
-            axes = [a.lower() for a in self.config.getlist(
-                'axes', count=2, default=['x', 'y'])]
-            joint_ax = {'x': ['y'], 'y': ['x']}
-        elif self.conf_kin == 'cartesian':
-            self.do_level = False
-            axes = [a.lower() for a in self.config.getlist('axes')]
-            joint_ax = {}
-        else:
-            raise self.config.error(f"motors_sync: Not supported "
-                                    f"kinematics '{self.conf_kin}'")
-        if any(axis not in valid_axes for axis in axes):
-            raise self.config.error(f"motors_sync: Invalid axes "
-                                    f"parameter '{','.join(axes)}'")
-        ph_off = self.stats_helper.get_axes_phase_offsets(axes)
-        logging.info(f'motors_sync_phase_offset: {ph_off}')
-        self.motion = {ax: MotionAxis(self, ax, joint_ax, ph_off)
-                       for ax in axes}
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self._check_common_attr()
-
-    def _init_sync_method(self):
-        methods = ['sequential', 'alternately', 'synchronous', 'default']
-        _sync_method = self.config.get(
-            'sync_method', {m: m for m in methods}, 'default')
-        self.config.deprecate('sync_method')
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self.sync_method = 'synchronous'
-        else:
-            self.sync_method = 'sequential'
-
-    def gsend(self, params):
-        self.gcode.run_script_from_command(params)
-
-    def homing(self):
-        # Homing and going to center
-        now = self.reactor.monotonic()
-        axes_names = list(self.motion.keys())
-        homed_axes = self.kin.get_status(now)['homed_axes']
-        if any(a not in homed_axes for a in axes_names):
-            self.gsend(f"G28 {' '.join(axes_names)}")
-        center_pos = (f'{a}{c.limits[2]}' for a, c in self.motion.items())
-        self.gsend(f"G0 {' '.join(center_pos)} F{self.travel_speed * 60}")
-        self.toolhead.dwell(MOTOR_STALL_TIME)
-        self.toolhead.flush_step_generation()
-
-    def _single_sync(self, m):
-        # "m" is a main axis, just single axis
-        if m.is_move_dir_unknown():
-            if not m.actual_msteps or m.curr_retry:
-                m.new_magnitude = m.measure_deviation()
-                m.magnitude = m.new_magnitude
-                self.msg_helper.static_msg(m)
-            if (not m.actual_msteps
-                    and m.retry_tolerance
-                    and m.new_magnitude < m.retry_tolerance):
-                m.is_finished = True
-                return
-            m.detect_move_dir()
-        m.calc_move_msteps()
-        m.step_move()
-        m.new_magnitude = m.measure_deviation()
-        self.msg_helper.stepped_msg(m)
-        if m.new_magnitude > m.magnitude:
-            m.step_move(dir=-1)
-            if m.retry_tolerance and m.magnitude > m.retry_tolerance:
-                m.curr_retry += 1
-                if m.curr_retry > m.max_retries:
-                    raise Exception('Too many retries')
-                m.set_move_dir(0)
-                self.msg_helper.retry_msg(m)
-                return
-            m.is_finished = True
-            return
-        m.magnitude = m.new_magnitude
-
-    def check_axis_drift(self, m, s):
-        # Note: m.axes_steps_diff == s.axes_steps_diff
-        steps_diff = abs(abs(m.drift_msteps) - abs(s.drift_msteps))
-        if steps_diff >= m.axes_steps_diff:
-            m.new_magnitude = m.magnitude = m.measure_deviation()
-            self.msg_helper.static_msg(m)
-            m.drift_msteps, s.drift_msteps = 0, 0
-            return True
-
-    def _run_sync(self):
-        # Axes synchronization
-        if self.sync_method == 'synchronous' and len(self.axes) > 1:
-            cycling = itertools.cycle(self.axes)
-            max_ax = [c for c in sorted(
-                self.motion.values(), key=lambda i: i.init_magnitude)][-1]
-            max_ax.detect_move_dir()
-            while True:
-                axis = next(cycling)
-                cycling, cycle = itertools.tee(cycling)
-                m = self.motion[axis]
-                sec = next(cycle)
-                s = self.motion[sec]
-                if m.is_finished:
-                    if all(self.motion[ax].is_finished for ax in self.axes):
-                        break
-                    continue
-                if m.magnitude < s.magnitude and not s.is_finished:
-                    self.check_axis_drift(m, s)
-                    continue
-                self._single_sync(m)
-        elif self.sync_method == 'sequential' or len(self.axes) == 1:
-            for axis in self.axes:
-                m = self.motion[axis]
-                # To skip measure_deviation() in _single_sync()
-                m.detect_move_dir()
-                while True:
-                    if m.is_finished:
-                        if all(self.motion[ax].is_finished for ax in self.axes):
-                            return
-                        break
-                    self._single_sync(m)
-        else:
-            raise Exception('Error in sync methods!')
-
     cmd_SYNC_MOTORS_help = 'Start motors synchronization'
-    def cmd_SYNC_MOTORS(self, gcmd, force_run=False):
-        # Live variables
-        axes_from_gcmd = gcmd.get('AXES', '')
-        if axes_from_gcmd:
-            axes_from_gcmd = axes_from_gcmd.split(',')
-            if any([axis not in self.motion.keys()
-                    for axis in axes_from_gcmd]):
+    def cmd_SYNC_MOTORS(self, gcmd):
+        # Get axes to sync
+        axes_names = gcmd.get('AXES', None)
+        mt_axes = self.kin_helper.get_motion_axes()
+        if axes_names is not None:
+            axes_names = {a.lower() for a in axes_names.split(',')}
+            if any(name not in mt_axes for name in axes_names):
                 raise self.gcode.error(f'Invalid axes parameter')
-            self.axes = [axis for axis in axes_from_gcmd]
+            axes = [mt_axes[ax] for ax in mt_axes if ax in axes_names]
         else:
-            self.axes = list(self.motion.keys())
-        chip = gcmd.get(f'ACCEL_CHIP', '')
-        for axis in self.axes:
-            m = self.motion[axis]
-            if not isinstance(m.chip_helper, AccelHelper):
-                continue
-            ax_chip = gcmd.get(f'ACCEL_CHIP_{axis.upper()}', chip)
-            if ax_chip and ax_chip != m.chip_helper.chip_name:
-                try:
-                    m.init_accel_chip_helper(ax_chip)
-                except Exception as e:
-                    raise self.gcode.error(e)
-            retry_tol = gcmd.get_int(f'RETRY_TOLERANCE_{axis.upper()}', 0)
-            if not retry_tol:
-                retry_tol = gcmd.get_int(f'RETRY_TOLERANCE', 0)
-            if retry_tol:
-                m.retry_tolerance = retry_tol
-            retries = gcmd.get_int(f'RETRIES_{axis.upper()}', 0)
-            if not retries:
-                retries = gcmd.get_int(f'RETRIES', 0)
-            if retries:
-                m.max_retries = retries
-        # Run
+            axes = list(mt_axes.values())
+        # Check axes sensors, retry tolerance, retries count change
+        chip = gcmd.get(f'ACCEL_CHIP', None)
+        for axis in axes:
+            axis_name = axis.name.upper()
+            if isinstance(axis.chip_helper, AccelHelper):
+                ax_chip = gcmd.get(f'ACCEL_CHIP_{axis_name}', chip)
+                if ax_chip and ax_chip != axis.chip_helper.get_name():
+                    try:
+                        axis.init_accel_chip_helper(ax_chip)
+                    except Exception as e:
+                        raise self.gcode.error(str(e))
+            retry_tol = gcmd.get_float(f'RETRY_TOLERANCE_{axis_name}',
+                                       default=None, above=0.)
+            if retry_tol is None:
+                retry_tol = gcmd.get_float(f'RETRY_TOLERANCE',
+                                           default=None, above=0.)
+            if retry_tol is not None:
+                axis.set_retry_tolerance(retry_tol)
+            retries = gcmd.get_int(f'RETRIES_{axis_name}',
+                                   default=None, minval=0)
+            if retries is None:
+                retries = gcmd.get_int(f'RETRIES',
+                                       default=None, minval=0)
+            if retries is not None:
+                axis.set_max_retries(retries)
         self.status.reset()
-        self.homing()
-        self.gcode.respond_info('Motors synchronization started', True)
+        self.gcode.respond_info('Motors synchronization started')
         try:
-            # Try restore last sync position on cold start
-            for axis in self.axes:
-                self.motion[axis].apply_phase_offset()
-            # Init axes magnitudes
-            for axis in self.axes:
-                m = self.motion[axis]
-                m.on_start()
-                m.init_magnitude = m.magnitude = m.measure_deviation()
-                self.msg_helper.start_msg(m)
-            # Check if all axes in tolerance
-            mot_axes_to_sync = [self.motion[ax] for ax in self.axes]
-            if (not force_run and all(
-                    m.init_magnitude < m.retry_tolerance
-                    for m in mot_axes_to_sync)):
-                for m in mot_axes_to_sync:
-                    m.on_done()
-                self.msg_helper.in_tolerance_msg(mot_axes_to_sync)
-            else:
-                self._run_sync()
-                # Info
-                for axis in self.axes:
-                    m = self.motion[axis]
-                    m.on_done()
-                    self.msg_helper.done_msg(m)
-            self.status.check_retry_result('done')
-        except Exception as e:
-            for axis in self.axes:
-                try:
-                    self.motion[axis].on_error()
-                except:
-                    raise
+            self.kin_helper.start_sync(axes)
+        except self.gcode.error as e:
             raise self.gcode.error(str(e))
+        except:
+            raise
+        self.status.check_retry_result('done')
 
     cmd_SYNC_MOTORS_CALIBRATE_help = 'Calibrate synchronization process model'
     def cmd_SYNC_MOTORS_CALIBRATE(self, gcmd):
@@ -1195,8 +1434,10 @@ class MotorsSync:
 class MotorsSyncCalibrate:
     def __init__(self, sync):
         self.sync = sync
-        self.reactor = sync.printer.get_reactor()
-        self.gcode = sync.printer.lookup_object('gcode')
+        self.kin_helper = sync.kin_helper
+        self.printer = sync.printer
+        self.reactor = self.printer.get_reactor()
+        self.gcode = self.printer.lookup_object('gcode')
         try:
             self._load_modules()
         except ImportError as e:
@@ -1305,10 +1546,10 @@ class MotorsSyncCalibrate:
         return f'Access to interactive plot at: {png_path}'
 
     def save_config(self, axis, func):
-        configfile = self.sync.printer.lookup_object("configfile")
-        axes = [axis] + [a for a in self.sync.motion[axis].joint_axes]
-        for ax in axes:
-            pname = f'steps_model_{ax}'
+        configfile = self.printer.lookup_object("configfile")
+        axes_names = self.kin_helper.get_linked_calibration_axes(axis)
+        for axis_name in axes_names:
+            pname = f'steps_model_{axis_name}'
             func_name = func['name']
             func_coeffs = list(map(str, func['coeffs']))
             block = func_name + ',\n  ' + ',\n  '.join(func_coeffs)
@@ -1316,61 +1557,30 @@ class MotorsSyncCalibrate:
             msg = f"{pname}: {func_name}, {','.join(func_coeffs)}"
             self.gcode.respond_info(msg)
         self.gcode.respond_info(
-            f"Motors sync model for '{', '.join(axes)}' axis "
-             "has been calibrated.\nThe SAVE_CONFIG command "
+            f"Motors sync model for '{', '.join(axes_names)}' "
+             "axis has been calibrated.\nThe SAVE_CONFIG command "
              "will update the printer config\n file with new "
              "parameters and restart the printer.")
 
-    def run_calibrate(self, gcmd, fullstep=16):
-        # "m" is a main axis, just single axis
+    def run_calibrate(self, gcmd):
+        axis_name = gcmd.get('AXIS').lower()
+        axis = self.kin_helper.motion_axes.get(axis_name)
+        if axis is None:
+            raise self.gcode.error(f'Invalid axis: {axis_name.upper()}')
+        peak_mstep = gcmd.get_int('DISTANCE', 16, minval=2, maxval=16 * 2)
         repeats = gcmd.get_int('REPEATS', 2, minval=2, maxval=100)
-        axis = gcmd.get('AXIS').lower()
-        m = self.sync.motion.get(axis, None)
-        if m is None:
-            raise self.gcode.error(f'Invalid axis: {axis.upper()}')
-        peak_mstep = gcmd.get_int('DISTANCE', fullstep,
-                                  minval=2, maxval=fullstep*2)
         need_plot = False
         need_plot_str = gcmd.get('PLOT', 'True').lower()
         if need_plot_str == 'true' or need_plot_str == '1':
             need_plot = True
         self.gcode.respond_info(
-            f'Calibration started on {axis.upper()} axis with '
+            f'Calibration started on {axis.name_prefixed} axis with '
             f'{repeats} repeats, move to +-{peak_mstep}/16 microstep')
         self.gcode.respond_info('Synchronizing before calibration...')
-        self.sync.cmd_SYNC_MOTORS(gcmd, force_run=True)
-        max_steps = 0
-        invs = [1, -1, -1, 1]
-        y_samples = [-1,]
-        mcu_stepper1 = m.get_steppers()[1]
-        looped_pos = itertools.cycle([m.rd, -m.rd, -m.rd, m.rd])
-        m.on_start()
-        # Scale calibration steps to 1/16
-        m.move_msteps = m.microsteps // fullstep
-        emul_peak_mstep = peak_mstep * m.move_msteps
-        m.toggle_main_stepper(0)
-        for r in range(1, repeats + 1):
-            self.gcode.respond_info(
-                f'Repeats: {r}/{repeats} Move to +-'
-                f'{emul_peak_mstep}/{m.microsteps} microstep')
-            self.sync.stepper_move.manual_move(
-                mcu_stepper1, [next(looped_pos)])
-            for inv in invs:
-                m.set_move_dir(inv)
-                for _ in range(peak_mstep):
-                    m.step_move()
-                    m.new_magnitude = m.measure_deviation()
-                    self.sync.msg_helper.stepped_msg(m)
-                    if m.new_magnitude > max(y_samples):
-                        max_steps += 1
-                    y_samples.append(m.new_magnitude)
-        if repeats % 2 == 1:
-            self.sync.stepper_move.manual_move(
-                mcu_stepper1, [next(looped_pos)])
-        m.magnitude = m.new_magnitude
-        m.on_done()
-        # To array with removed first sample
-        y_samples = np.sort(np.array(y_samples[1:]))
+        self.kin_helper.start_sync(force_run=True)
+        max_steps, magnitudes = self.kin_helper\
+            .calibrate_axis_steps_model(axis, peak_mstep, repeats)
+        y_samples = np.sort(np.array(magnitudes))
         x_samples = np.linspace(0.01, max_steps, len(y_samples))
         div = 1. if peak_mstep < 5 else peak_mstep / 5
         x_prio_len = int(x_samples.shape[0] // div)
@@ -1389,8 +1599,8 @@ class MotorsSyncCalibrate:
                                                  x_prio_len)
                 msg = None
                 if need_plot:
-                    msg = self.plotter(*data, axis, m.chip_helper \
-                                        .chip_name, peak_mstep, fullstep)
+                    msg = self.plotter(*data, axis.name,
+                        axis.chip_helper.chip_name, peak_mstep, 16)
                 c_conn.send((False, (msg, data)))
                 c_conn.close()
             except Exception as e:
@@ -1539,7 +1749,7 @@ class MotionAxesStats:
         format = 'axis,status,magnitudes,steps,msteps,retries,offset,date,'
         self.log_helper = LogFileHelper(file_name, format)
 
-    def get_axes_phase_offsets(self, axes):
+    def _find_axes_phase_offsets(self, axes):
         raw_log = self.log_helper.read_log()
         if raw_log.size == 0:
             return {}
@@ -1555,6 +1765,11 @@ class MotionAxesStats:
             a[p[0]] = p[6]
         return a
 
+    def get_axes_phase_offsets(self, axes):
+        offsets = self._find_axes_phase_offsets(axes)
+        logging.info(f'motors_sync_phase_offset: {offsets}')
+        return offsets
+
     def write_axis_stats_log(self, axis, state):
         if self.log_helper.error:
             return
@@ -1565,6 +1780,7 @@ class MotionAxesStats:
         msteps = axis.microsteps
         retries = axis.curr_retry
         offset = axis.query_phases_offset()
+        offset = "None" if offset is None else offset
         date = datetime.now().strftime('%Y-%m-%d')
         self.log_helper.write_log([name, state, magnitudes, pos,
                                    msteps, retries, offset, date])
