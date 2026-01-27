@@ -1129,10 +1129,9 @@ class MotionAxis:
                     f"for '{mcu_stepper.get_name()}' stepper")
 
     def add_steppers(self, enable, step, buzz, conflict):
-        steppers_set = {enable, step, buzz}
-        if len(steppers_set) == 1:
-            raise Exception("Cannot put all tasks on one stepper")
-        self_steppers = list(steppers_set)
+        self_steppers = list(dict.fromkeys((enable, step, buzz)))
+        if len(self_steppers) != 2:
+            raise ValueError("Steppers allocation error")
         self_tmcs = list(self._get_tmc_drivers(self_steppers))
         self.steppers = {
             'self_steppers': self_steppers,
