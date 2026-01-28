@@ -1215,21 +1215,31 @@ class MotionAxis:
         phase = mcu_tmc.mcu_tmc.get_register(reg)
         phase = mcu_tmc.fields.get_field(field_name, phase)
         if not mcu_stepper.get_dir_inverted()[0]:
-            return 1023 - phase
+            return (1024 - phase) % 1024
         return phase
 
     def query_phases_offset(self):
         if self.is_multi_axis:
             return None
-        items = zip(self.steppers['self_steppers'],
-                    self.steppers['self_tmcs'])
-        p1, p2 = (self._query_phase(s, t) for s, t in items)
-        return p2 - p1
+        # If the steppers are inverted to each other, the offset
+        # of the initial non-inverted phase position must be taken
+        # into account to calculate the correct phases offset.
+        def query_and_norm_phase(mcu_stepper, tmc):
+            phase = self._query_phase(mcu_stepper, tmc)
+            if mcu_stepper.get_dir_inverted()[0]:
+                return phase
+            offset = 1 << tmc.fields.get_field("mres")
+            return (phase + offset) % 1024
+        p1, p2 = (query_and_norm_phase(s, t)
+                  for s, t in zip(self.steppers['self_steppers'],
+                                  self.steppers['self_tmcs']))
+        return ((p2 - p1 + 512) % 1024) - 512
 
     def apply_phase_offset(self):
-        if self.phase_offset is None:
+        if self.phase_offset is None or self.is_multi_axis:
             return
         if self.query_phases_offset() != 0:
+            # Phases offset has already been changed by anyone
             return
         move_d = self.phase_offset / 256 * self.move_d * self.microsteps
         if abs(move_d) < self.move_d * 2:
