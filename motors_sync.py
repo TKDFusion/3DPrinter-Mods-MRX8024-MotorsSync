@@ -1237,21 +1237,36 @@ class MotionAxis:
 
     def apply_phase_offset(self):
         if self.phase_offset is None or self.is_multi_axis:
-            return
+            return False
         if self.query_phases_offset() != 0:
             # Phases offset has already been changed by anyone
-            return
-        move_d = self.phase_offset / 256 * self.move_d * self.microsteps
-        if abs(move_d) < self.move_d * 2:
-            return
-        self.toggle_main_stepper(0, (PIN_MIN_TIME, PIN_MIN_TIME))
-        mcu_stepper = self.steppers['step_stepper']
-        self.stepper_move.manual_move(mcu_stepper, [move_d])
-        msteps = int(move_d // self.move_d)
+            return False
+        move_msteps = self.phase_offset * self.microsteps // 256
+        if abs(move_msteps) < 2:
+            return False
+        move_msteps1 = move_msteps // 2
+        move_msteps2 = move_msteps - move_msteps1
+        move_dist1 = move_msteps1 * self.move_d
+        move_dist2 = move_msteps2 * self.move_d * -1
+        en_mcu_stepper = self.steppers['enable_stepper']
+        st_mcu_stepper = self.steppers['step_stepper']
+        en1 = self.stepper_move.steppers_enable([en_mcu_stepper], 0)
+        en2 = self.stepper_move.steppers_enable([st_mcu_stepper], 1)
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        self.stepper_move.manual_move(st_mcu_stepper, [move_dist1])
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        self.stepper_move.steppers_enable([st_mcu_stepper], 0)
+        self.stepper_move.steppers_enable([en_mcu_stepper], 1)
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        self.stepper_move.manual_move(en_mcu_stepper, [move_dist2])
+        self.toolhead.dwell(MOTOR_STALL_TIME)
         self.gcode.respond_info(
             f'{self.name_prefixed}-Restore previous '
-            f'position: {msteps}/{self.microsteps} step')
-        self.toggle_main_stepper(1, (PIN_MIN_TIME, PIN_MIN_TIME))
+            f'position: {move_msteps}/{self.microsteps} step')
+        self.stepper_move.steppers_enable([en_mcu_stepper], en1)
+        self.stepper_move.steppers_enable([st_mcu_stepper], not en2)
+        self.toolhead.dwell(MOTOR_STALL_TIME)
+        return True
 
     def toggle_main_stepper(self, mode, times=None):
         if times is None:
