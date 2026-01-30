@@ -53,9 +53,11 @@ class BaseKinematics:
     def apply_axes_phase_offsets(self, axes):
         # Try restore last sync position on cold start
         self.toolhead.wait_moves()
+        applied = False
         for axis in axes:
-            axis.apply_phase_offset()
+            applied |= axis.apply_phase_offset()
         self.toolhead.dwell(MOTOR_STALL_TIME)
+        return applied
 
     def is_axes_in_tolerance(self, axes):
         return all(a.init_magnitude < a.retry_tolerance for a in axes)
@@ -1410,16 +1412,20 @@ class MotorsSync:
 
     cmd_SYNC_MOTORS_help = 'Start motors synchronization'
     def cmd_SYNC_MOTORS(self, gcmd):
-        # Get axes to sync
+        _axes = self.kin_helper.get_motion_axes()
+        axes = list(_axes.values())
+        if gcmd.get('RESTORE_SYNC', None) is not None:
+            if not self.kin_helper.apply_axes_phase_offsets(axes):
+                self.gcode.respond_info("Motors sync position already "
+                                        "restored or nothing to restore")
+            return
+        # Override axes to sync from gcmd
         axes_names = gcmd.get('AXES', None)
-        mt_axes = self.kin_helper.get_motion_axes()
         if axes_names is not None:
             axes_names = {a.lower() for a in axes_names.split(',')}
-            if any(name not in mt_axes for name in axes_names):
+            if any(name not in _axes for name in axes_names):
                 raise self.gcode.error(f'Invalid axes parameter')
-            axes = [mt_axes[ax] for ax in mt_axes if ax in axes_names]
-        else:
-            axes = list(mt_axes.values())
+            axes = [_axes[ax] for ax in _axes if ax in axes_names]
         # Check axes sensors, retry tolerance, retries count change
         chip = gcmd.get(f'ACCEL_CHIP', None)
         for axis in axes:
@@ -1447,12 +1453,7 @@ class MotorsSync:
                 axis.set_max_retries(retries)
         self.status.reset()
         self.gcode.respond_info('Motors synchronization started')
-        try:
-            self.kin_helper.start_sync(axes)
-        except self.gcode.error as e:
-            raise self.gcode.error(str(e))
-        except:
-            raise
+        self.kin_helper.start_sync(axes)
         self.status.check_retry_result('done')
 
     cmd_SYNC_MOTORS_CALIBRATE_help = 'Calibrate synchronization process model'
