@@ -3,7 +3,8 @@
 # Copyright (C) 2024-2026  Maksim Bolgov <maksim8024@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, traceback, itertools
+import os, logging, traceback, itertools, csv, ast, importlib.util
+import threading, multiprocessing
 from datetime import datetime
 import numpy as np
 import chelper
@@ -1476,32 +1477,45 @@ class MotorsSyncCalibrate:
         self.printer = sync.printer
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
-        try:
-            self._load_modules()
-        except ImportError as e:
-            raise self.gcode.error(f'motors_sync: Could not import: {e}')
         self.path = os.path.expanduser(PLOT_PATH)
-        self.check_export_path()
-
-    @staticmethod
-    def _load_modules():
-        globals().update({
-            'wrap': __import__('textwrap', fromlist=['wrap']).wrap,
-            'multiprocessing': __import__('multiprocessing'),
-            'plt': __import__('matplotlib.pyplot', fromlist=['']),
-            'ticker': __import__('matplotlib.ticker', fromlist=['']),
-            'curve_fit': __import__(
-                'scipy.optimize', fromlist=['curve_fit']).curve_fit
-        })
-
-    def check_export_path(self):
-        if os.path.exists(self.path):
-            return
         try:
-            os.makedirs(self.path)
-        except OSError as e:
-            raise self.gcode.error(
-                f'Error generate path {self.path}: {e}')
+            self._check_modules()
+            self._check_export_path()
+        except Exception as e:
+            raise self.gcode.error(f'motors_sync: {e}')
+
+    def _check_modules(self):
+        result = []
+        required_mods = ['textwrap', 'matplotlib.pyplot',
+                         'matplotlib.ticker', 'scipy.optimize']
+        def find_mods():
+            nonlocal result
+            try:
+                missing_mods = [
+                    mod for mod in required_mods if
+                    importlib.util.find_spec(mod) is None]
+                result = (True, ', '.join(missing_mods))
+            except BaseException as e:
+                result = (False, e)
+        thread = threading.Thread(target=find_mods)
+        thread.start()
+        now = start_t = self.reactor.monotonic()
+        while thread.is_alive():
+            if now > start_t + 30.0:
+                raise Exception("Check packages stuck!")
+            now = self.reactor.pause(now + .1)
+        thread.join()
+        if not result[0]:
+            raise Exception(f'Check packages finished '
+                            f'with error {result[1]}')
+        if result[1]:
+            raise Exception(f"Missing packages: {result[1]}")
+
+    def _check_export_path(self):
+        try:
+            os.makedirs(self.path, exist_ok=True)
+        except Exception as e:
+            raise Exception(f'Failed to generate export path\n{e}')
 
     math_models = {
         'linear': (lambda x, a, b: a*x + b, '-.', '#DF8816'),
@@ -1513,6 +1527,7 @@ class MotorsSyncCalibrate:
     }
 
     def find_best_func(self, x_data, y_data, x_prio_len=0, maxfev=999999999):
+        from scipy.optimize import curve_fit
         x_len = len(x_data)
         if x_prio_len == 0 or x_prio_len == x_len:
             x_prio_len = x_len
@@ -1544,7 +1559,9 @@ class MotorsSyncCalibrate:
 
     def plotter(self, x_data, y_data, funcs, axis, accel_chip,
                 peak_msteps, fullstep, rmse_lim=20000):
-        # Plotting
+        from textwrap import wrap
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
         pow_lim = (-2, 2)
         fig, ax = plt.subplots()
         ax.scatter(x_data, y_data, label='Samples',
@@ -1640,25 +1657,27 @@ class MotorsSyncCalibrate:
                     msg = self.plotter(*data, axis.name,
                         axis.chip_helper.chip_name, peak_mstep, 16)
                 c_conn.send((False, (msg, data)))
-                c_conn.close()
             except Exception as e:
                 c_conn.send((True, (e,)))
+            finally:
                 c_conn.close()
         self.gcode.respond_info('Data processing...')
         p_conn, c_conn = multiprocessing.Pipe()
         proc = multiprocessing.Process(target=samples_processing)
         proc.daemon = True
         proc.start()
-        lim_t = 60.
         now = start_t = last_report_time = self.reactor.monotonic()
         while proc.is_alive():
             if now > last_report_time + 10.:
                 last_report_time = now
                 self.gcode.respond_info('Data processing...')
-                if now > start_t + lim_t:
+                if now > start_t + 60.:
+                    proc.terminate()
                     raise self.gcode.error(f'Data processing stuck!')
-            now = self.reactor.pause(now + .1)
+            now = self.reactor.pause(now + 1.)
         err, res = p_conn.recv()
+        proc.join()
+        p_conn.close()
         if err:
             raise self.gcode.error(f'Data processing finished '
                                    f'with error: {res[0]}')
@@ -1705,7 +1724,6 @@ class KalmanLiteFilter:
 # Generic csv log file helper with header and size validation.
 class LogFileHelper:
     def __init__(self, file_name, format, max_size=1000):
-        self._load_modules()
         self.format = format
         self.max_size = max_size
         # Variables
@@ -1714,11 +1732,6 @@ class LogFileHelper:
         self.error = ''
         # Checks
         self.check_log()
-
-    @staticmethod
-    def _load_modules():
-        for module in ['csv', 'ast']:
-            globals()[module] = __import__(module)
 
     def check_log(self):
         if os.path.exists(self.log_path):
