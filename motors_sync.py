@@ -207,14 +207,6 @@ class CartesianKinematics(BaseKinematics):
                 raise config.error(
                     f"motors_sync: Not supported "
                     f"'{len(belt_steppers)}' count of motors")
-            for stepper in belt_steppers:
-                st_section = config.getsection(stepper.get_name())
-                st_msteps = st_section.getint('microsteps')
-                if axis.microsteps > st_msteps:
-                    raise config.error(
-                        f'motors_sync: Invalid config microsteps '
-                        f'count, cannot be more than in stepper '
-                        f'config, {axis.microsteps} > {st_msteps}')
             axis.add_steppers(*belt_steppers, belt_steppers[1], None)
 
     def axes_sync(self, axes):
@@ -275,14 +267,6 @@ class CoreXYKinematics(BaseKinematics):
                 raise config.error(
                     f"motors_sync: Not supported "
                     f"'{len(belt_steppers)}' count of motors")
-            for stepper in belt_steppers:
-                st_section = config.getsection(stepper.get_name())
-                st_msteps = st_section.getint('microsteps')
-                if axis.microsteps > st_msteps:
-                    raise config.error(
-                        f'motors_sync: Invalid config microsteps '
-                        f'count, cannot be more than in stepper '
-                        f'config, {axis.microsteps} > {st_msteps}')
             axes_alloc_steppers.append([axis, belt_steppers])
         # Add 1 motor from the opposite axis to conflict motors on each
         # axis. Two enabled motors on the same axis (belt) can twist
@@ -987,8 +971,8 @@ class MotionAxis:
         self.new_magnitude = 0.
         self.curr_retry = 0
         self.is_finished = False
-        self.chip_helper = None
         self.motion_log = []
+        self.chip_helper = None
         self.steppers = None
         st_section = config.getsection(main_stepper)
         self.rd = st_section.getfloat('rotation_distance')
@@ -1131,11 +1115,21 @@ class MotionAxis:
                     f"motors_sync: Unable to find TMC driver "
                     f"for '{mcu_stepper.get_name()}' stepper")
 
+    def _validate_steppers(self, mcu_steppers, tmcs):
+        for stepper, tmc in zip(mcu_steppers, tmcs):
+            st_msteps = 256 >> tmc.fields.get_field("mres")
+            if self.microsteps > st_msteps:
+                raise self.printer.config_error(
+                    f'motors_sync: Invalid config microsteps '
+                    f'count, cannot be more than in steppers '
+                    f'config, {self.microsteps} > {st_msteps}')
+
     def add_steppers(self, enable, step, buzz, conflict):
         self_steppers = list(dict.fromkeys((enable, step, buzz)))
         if len(self_steppers) != 2:
             raise ValueError("Steppers allocation error")
         self_tmcs = list(self._get_tmc_drivers(self_steppers))
+        self._validate_steppers(self_steppers, self_tmcs)
         self.steppers = {
             'self_steppers': self_steppers,
             'self_tmcs': self_tmcs,
