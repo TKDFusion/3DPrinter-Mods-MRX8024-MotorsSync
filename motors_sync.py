@@ -666,11 +666,21 @@ class EncoderHelper(BaseSensorHelper):
         super().__init__(axis, chip_name)
         self.dim_type = 'deviation'
         self.last_raw_deviation = 0
+        self._check_retry_tolerance()
 
     def _init_chip_config(self):
         self.chip_config = self.printer.lookup_object(self.chip_name)
         self._check_sample_rate()
         self._check_encoder_place()
+
+    def _check_retry_tolerance(self):
+        half_step_distance_um = np.ceil(self.axis.move_d * 1e3 / 2)
+        retry_tolerance = self.axis.retry_tolerance
+        if retry_tolerance < half_step_distance_um:
+            raise self.printer.config_error(
+                f"motors_sync: Parameter 'retry_tolerance' cannot "
+                f"be less than microsteps half microstep distance, "
+                f"{retry_tolerance} < {half_step_distance_um} (µm)")
 
     def _check_sample_rate(self):
         per = self.chip_config.sample_period
@@ -986,7 +996,6 @@ class MotionAxis:
             self.microsteps = config.getchoice(
                 'microsteps', msteps_dict, default=16)
         self.move_d = self.rd / fspr / self.microsteps
-        self._init_chip_helper(config)
         conf_fans = config.getlist(f'head_fan_{name}', '')
         if not conf_fans:
             conf_fans = config.getlist('head_fan', [])
@@ -1002,12 +1011,11 @@ class MotionAxis:
         if not self.axes_steps_diff:
             self.axes_steps_diff = config.getint(
                 'axes_steps_diff', self.max_step_size + 1, minval=1)
-        rmin = self.move_d * 1e3
         self.retry_tolerance = config.getfloat(
-            f'retry_tolerance_{name}', default=0, above=rmin)
+            f'retry_tolerance_{name}', default=0, above=0.)
         if not self.retry_tolerance:
             self.retry_tolerance = config.getfloat(
-                'retry_tolerance', default=0, above=rmin)
+                'retry_tolerance', default=0, above=0.)
         self.max_retries = config.getint(
             f'retries_{name}', default=0, minval=0, maxval=10)
         if not self.max_retries:
@@ -1016,6 +1024,7 @@ class MotionAxis:
         self.name_prefixed = name.upper()
         if name_prefix := config.get(f'axis_prefix_{name}', None):
             self.name_prefixed = f'{name_prefix} {self.name_prefixed}'
+        self._init_chip_helper(config)
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
