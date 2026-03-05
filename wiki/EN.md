@@ -80,7 +80,7 @@ accel_chip:
 #    Simple coefficients describing the kalman filter.
 #microsteps: 16
 #    Maximum microstepping displacement of the stepper motor rotor.
-#steps_model: linear, 20000, 0
+#steps_model: linear, 10000, 0
 #    Mathematical model and its coefficients representing the dependence
 #    of stepper motor microstep displacement on the measured magnitude.
 #max_step_size: 3
@@ -149,7 +149,7 @@ G28 Z
 
 ### Synchronization model calibration
 The model represents the dependence of microsteps on magnitude. By default,
-it is linear with a coefficient of 20k, meaning that for every 20k of
+it is linear with a coefficient of 10_000, meaning that for every 10_000 of
 magnitude, there is one microstep of displacement. This is a basic and safe
 value, but for each user, depending on their printer configuration and even
 the accelerometer, this dependence will vary. The purpose of model

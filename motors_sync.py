@@ -1102,7 +1102,7 @@ class MotionAxis:
                 f"'encoder_chip_<axis>' must be provided")
         if accel_chip_name:
             self.init_accel_chip_helper(accel_chip_name, config)
-            def_steps_model = ['linear', 20000, 0]
+            def_steps_model = ['linear', 10000, 0]
         elif enc_chip_name:
             self.chip_helper = EncoderHelper(self, enc_chip_name)
             def_steps_model = ['enc_auto', self.move_d]
